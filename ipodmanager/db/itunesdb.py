@@ -23,6 +23,7 @@ safest possible behavior against someone's real music collection.
 from __future__ import annotations
 
 import struct
+import zlib
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -68,30 +69,37 @@ class MhodType:
     GROUPING = 13
 
 
+_MHOD_GENERIC_HEADER = struct.Struct("<4sIII")  # header_id, header_len, total_len, type (16 bytes)
 _MHOD_STRING_HEADER = struct.Struct("<4sIIIIIIIII")
 # header_id, header_len, total_len, type, unknown1, unknown2, position,
-# string_len, unknown3, unknown4  (= 40 bytes, matches libgpod's
-# _MhodHeaderString struct exactly)
+# string_len, unknown3, unknown4 (= 40 bytes). Verified against a real
+# device: header_len itself is always 24 here (it only covers through
+# unknown2 -- position/string_len/unknown3/unknown4 are a fixed extension
+# always present for "type < 50" string mhods, regardless of what
+# header_len says), so header_len is NOT a reliable "is this the 40-byte
+# string layout" signal -- total_len and mtype are.
+_MHOD_STRING_HEADER_LEN_FIELD = 24
 
 
 def pack_mhod_string(mhod_type: int, text: str) -> bytes:
     encoded = text.encode("utf-16-le")
     header = _MHOD_STRING_HEADER.pack(
-        b"mhod", 40, 40 + len(encoded), mhod_type, 0, 0, 0, len(encoded), 1, 0
+        b"mhod", _MHOD_STRING_HEADER_LEN_FIELD, 40 + len(encoded), mhod_type, 0, 0, 0, len(encoded), 1, 0
     )
     return header + encoded
 
 
 def parse_mhod(buf: bytes, offset: int) -> tuple[int, Optional[str], int]:
     """Returns (mhod_type, text_or_None, total_len_of_this_chunk)."""
-    magic, header_len, total_len, mtype, _u1, _u2, position, str_len, _u3, _u4 = (
-        _MHOD_STRING_HEADER.unpack_from(buf, offset)
-    )
+    magic, _header_len, total_len, mtype = _MHOD_GENERIC_HEADER.unpack_from(buf, offset)
     if magic != b"mhod":
         raise ValueError(f"expected mhod at offset {offset}, found {magic!r}")
-    if mtype >= 50 or str_len == 0 or header_len != 40:
+    if mtype >= 50 or total_len < 40:
         # Non-string mhod (smart playlist rules, sort-index blobs, etc) --
         # we don't interpret these, just report the span so callers can skip.
+        return mtype, None, total_len
+    _, _, _, _, _u1, _u2, _position, str_len, _u3, _u4 = _MHOD_STRING_HEADER.unpack_from(buf, offset)
+    if str_len == 0 or 40 + str_len > total_len:
         return mtype, None, total_len
     text_bytes = buf[offset + 40 : offset + 40 + str_len]
     try:
@@ -533,7 +541,15 @@ class ITunesDB:
             raise ValueError("not an iTunesDB (missing mhbd header)")
         header_raw = bytes(buf[0:header_len])
 
-        pos = header_len
+        # unknown1 doubles as a compression flag: 2 means everything after
+        # the (always-plaintext) mhbd header is zlib-deflated. Confirmed
+        # against a real iPhone 3G database -- iOS devices from the
+        # "compressed itunesdb" era (iPhone 3.0+/Nano 5G+) write it this
+        # way; older classic iPods write 1 and leave the body plain.
+        raw_body = bytes(buf[header_len:])
+        body = zlib.decompress(raw_body) if unknown1 == 2 else raw_body
+
+        pos = 0
         sections: list = []
         max_track_id = 0
         max_dbid = 0
@@ -541,7 +557,7 @@ class ITunesDB:
         have_playlists = False
 
         for _ in range(num_children):
-            mhsd_magic, mhsd_header_len, mhsd_total_len, index = struct.unpack_from("<4siii", buf, pos)
+            mhsd_magic, mhsd_header_len, mhsd_total_len, index = struct.unpack_from("<4siii", body, pos)
             if mhsd_magic != b"mhsd":
                 raise ValueError(f"expected mhsd at {pos}, found {mhsd_magic!r}")
             body_start = pos + mhsd_header_len
@@ -549,33 +565,33 @@ class ITunesDB:
 
             if index == 1 and not have_tracks:  # track list
                 have_tracks = True
-                _magic, mhlt_header_len, num_songs = struct.unpack_from("<4sii", buf, body_start)
+                _magic, mhlt_header_len, num_songs = struct.unpack_from("<4sii", body, body_start)
                 tpos = body_start + mhlt_header_len
                 tracks: list[RawTrack] = []
                 for _ in range(num_songs):
-                    t = parse_mhit(buf, tpos)
+                    t = parse_mhit(body, tpos)
                     tracks.append(t)
                     max_track_id = max(max_track_id, t.track_id)
                     max_dbid = max(max_dbid, t.display.get("dbid", 0))
-                    total_track_len = struct.unpack_from("<I", buf, tpos + 8)[0]
+                    total_track_len = struct.unpack_from("<I", body, tpos + 8)[0]
                     tpos += total_track_len
                 sections.append(TracksSection(tracks=tracks))
             elif index == 2 and not have_playlists:  # playlists
                 have_playlists = True
-                _magic, mhlp_header_len, num_pl = struct.unpack_from("<4sii", buf, body_start)
+                _magic, mhlp_header_len, num_pl = struct.unpack_from("<4sii", body, body_start)
                 ppos = body_start + mhlp_header_len
                 playlists: list[RawPlaylist] = []
                 for _ in range(num_pl):
-                    pl = parse_mhyp(buf, ppos)
+                    pl = parse_mhyp(body, ppos)
                     playlists.append(pl)
-                    plen = struct.unpack_from("<I", buf, ppos + 8)[0]
+                    plen = struct.unpack_from("<I", body, ppos + 8)[0]
                     ppos += plen
                 sections.append(PlaylistsSection(playlists=playlists))
             else:
                 # Unknown or duplicate-index section (album/artist index,
                 # Genius, podcasts, categorized playlists, ...): preserve
                 # verbatim.
-                sections.append(("raw", bytes(buf[pos:body_end])))
+                sections.append(("raw", bytes(body[pos:body_end])))
             pos = body_end
 
         return cls(
@@ -651,6 +667,9 @@ class ITunesDB:
 
         body = b"".join(parts)
         header = bytearray(self.header_raw)
+        unknown1 = struct.unpack_from("<I", header, 0x0C)[0]
+        if unknown1 == 2:  # this device's original db was zlib-compressed; match it
+            body = zlib.compress(body, level=9)
         total_len = len(header) + len(body)
         struct.pack_into("<I", header, 0x08, total_len)
         struct.pack_into("<I", header, 0x14, len(self.sections))

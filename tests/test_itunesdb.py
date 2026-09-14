@@ -7,10 +7,11 @@ from testing against a real device (see README).
 """
 
 import struct
+import zlib
 
 from ipodmanager.db import itunesdb as idb
 
-from .helpers import build_empty_mhbd
+from .helpers import build_empty_mhbd, build_empty_mhbd_compressed
 
 
 def test_parse_empty_db():
@@ -106,3 +107,28 @@ def test_unknown_mhsd_sections_are_preserved_verbatim():
 def test_ipod_path_conversion():
     assert idb.relpath_to_ipod_path("iPod_Control/Music/F00/A.m4a") == ":iPod_Control:Music:F00:A.m4a"
     assert idb.ipod_path_to_relpath(":iPod_Control:Music:F00:A.m4a") == "iPod_Control/Music/F00/A.m4a"
+
+
+def test_compressed_db_parses_and_roundtrips():
+    """iPhone/iPod Touch-generation devices zlib-compress everything after
+    the mhbd header (confirmed against a real iPhone 3G's iTunesCDB)."""
+    data = build_empty_mhbd_compressed()
+    db = idb.ITunesDB.parse(data)
+    assert db.tracks == []
+
+    meta = idb.TrackMeta(
+        track_id=0, dbid=0, title="Compressed Track",
+        ipod_location=idb.relpath_to_ipod_path("iTunes_Control/Music/F00/C.m4a"),
+    )
+    db.add_track(meta)
+
+    reserialized = db.serialize()
+    # still flagged as compressed, and the body must actually decompress
+    header_len = struct.unpack_from("<I", reserialized, 4)[0]
+    unknown1 = struct.unpack_from("<I", reserialized, 0x0C)[0]
+    assert unknown1 == 2
+    zlib.decompress(reserialized[header_len:])  # raises if not valid zlib
+
+    db2 = idb.ITunesDB.parse(reserialized)
+    assert len(db2.tracks) == 1
+    assert db2.tracks[0].display["title"] == "Compressed Track"

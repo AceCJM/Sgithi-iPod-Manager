@@ -17,6 +17,7 @@ from typing import Callable, Optional
 
 from .audio import inspect as audio_inspect
 from .audio import transcode
+from .db import hash72
 from .db import itunesdb as idb
 from .transport.base import Device
 
@@ -27,6 +28,22 @@ FILETYPE_LABELS = {
 }
 
 MUSIC_FOLDER_COUNT = 20
+
+SUPPORTED_AUDIO_EXTS = {".flac", ".m4a", ".mp4", ".m4b"}
+
+
+def discover_audio_files(folder: Path) -> list[Path]:
+    """Recursively find every supported audio file under folder, sorted for
+    a stable, predictable import order."""
+    folder = Path(folder)
+    found = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_AUDIO_EXTS]
+    return sorted(found)
+
+
+@dataclass
+class ImportResult:
+    imported: list[TrackRow]
+    errors: list[tuple[Path, str]]
 
 
 class LibraryError(RuntimeError):
@@ -101,14 +118,18 @@ class Library:
     def backup(self) -> Path:
         ts = time.strftime("%Y%m%d-%H%M%S")
         micros = f"{time.time() % 1:.6f}"[2:]
-        dest = self.device.backups_dir() / f"iTunesDB.{ts}-{micros}.bak"
-        shutil.copy2(self.device.itunesdb_path, dest)
+        dest = self.device.backups_dir() / f"{self.device.itunesdb_path.name}.{ts}-{micros}.bak"
+        # copyfile (not copy2): AFC-backed filesystems (iPhone, via ifuse)
+        # don't support chmod, which copy2 tries after copying data.
+        shutil.copyfile(self.device.itunesdb_path, dest)
         return dest
 
     def save(self) -> None:
         assert self.db is not None
         self.backup()
         data = self.db.serialize()
+        if self.device.kind == "iphone":
+            data = self._sign_for_iphone(data)
         tmp = self.device.itunesdb_path.with_suffix(".tmp")
         tmp.write_bytes(data)
         tmp.replace(self.device.itunesdb_path)
@@ -116,6 +137,21 @@ class Library:
             os.sync()
         except OSError:
             pass
+
+    def _sign_for_iphone(self, data: bytes) -> bytes:
+        device = self.device
+        assert device.udid_bytes is not None and device.hash_info_path is not None
+        try:
+            secret = hash72.get_or_bootstrap_secret(
+                device.hash_info_path, device.udid_bytes, existing_itdb_data=device.itunesdb_path.read_bytes()
+            )
+        except (ValueError, OSError) as e:
+            raise LibraryError(
+                "Couldn't get a hash72 signing secret for this iPhone. This device needs to have been "
+                "synced with real iTunes (or a libgpod-based tool) at least once already -- there's no "
+                f"way to derive a fresh signature otherwise. ({e})"
+            ) from e
+        return hash72.sign(data, secret)
 
     def import_file(self, src_path: Path, on_progress: Optional[Callable[[str], None]] = None) -> TrackRow:
         assert self.db is not None
@@ -153,7 +189,9 @@ class Library:
             if dest is None:
                 raise LibraryError("could not allocate a unique on-device filename")
 
-            shutil.copy2(work_path, dest)
+            # copyfile (not copy2): see backup()'s comment -- AFC/ifuse
+            # doesn't support chmod.
+            shutil.copyfile(work_path, dest)
         finally:
             if tmpdir:
                 shutil.rmtree(tmpdir, ignore_errors=True)
@@ -184,6 +222,43 @@ class Library:
         report(f"Adding {meta.title} to library")
         raw = self.db.add_track(meta)
         return TrackRow.from_raw(raw)
+
+    def import_paths(
+        self,
+        paths: list[Path],
+        on_progress: Optional[Callable[[int, int, str], None]] = None,
+        save: bool = True,
+    ) -> ImportResult:
+        """Import multiple files (e.g. everything found under a folder),
+        reporting (completed_count, total_count, message) as it goes, and
+        saving once at the end rather than once per file.
+        """
+        total = len(paths)
+        imported: list[TrackRow] = []
+        errors: list[tuple[Path, str]] = []
+
+        def report(i: int) -> Callable[[str], None]:
+            def _cb(stage_msg: str) -> None:
+                if on_progress:
+                    on_progress(i, total, stage_msg)
+
+            return _cb
+
+        for i, path in enumerate(paths):
+            try:
+                row = self.import_file(path, on_progress=report(i))
+                imported.append(row)
+            except Exception as e:  # noqa: BLE001 - one bad file shouldn't abort the whole batch
+                errors.append((path, str(e)))
+            if on_progress:
+                on_progress(i + 1, total, path.name)
+
+        if save and imported:
+            if on_progress:
+                on_progress(total, total, "Saving library…")
+            self.save()
+
+        return ImportResult(imported=imported, errors=errors)
 
     def delete_track(self, track_id: int) -> None:
         assert self.db is not None
