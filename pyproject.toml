@@ -1,0 +1,24 @@
+[project]
+name = "ipodmanager"
+version = "0.1.0"
+description = "GTK app to browse, upload, and delete music on classic iPods and old iPhones/iPod Touches, without iTunes"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+dependencies = [
+    "PyGObject>=3.42",
+    "mutagen>=1.46",
+]
+
+[project.scripts]
+ipodmanager = "ipodmanager.ui.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ipodmanager*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

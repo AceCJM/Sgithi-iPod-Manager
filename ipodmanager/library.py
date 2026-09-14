@@ -1,0 +1,198 @@
+"""Ties a mounted device, its iTunesDB, and the local filesystem together:
+scanning what's on the device, importing new files (transcoding FLAC to
+ALAC on the way), and deleting tracks.
+"""
+
+from __future__ import annotations
+
+import os
+import random
+import shutil
+import string
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional
+
+from .audio import inspect as audio_inspect
+from .audio import transcode
+from .db import itunesdb as idb
+from .transport.base import Device
+
+FILETYPE_LABELS = {
+    "alac": "Apple Lossless audio file",
+    "aac": "AAC audio file",
+    "flac": "Apple Lossless audio file",  # FLAC is always transcoded before this is used
+}
+
+MUSIC_FOLDER_COUNT = 20
+
+
+class LibraryError(RuntimeError):
+    pass
+
+
+@dataclass
+class TrackRow:
+    """Flattened view of a device track, for display in the UI."""
+
+    track_id: int
+    title: str
+    artist: str
+    album: str
+    genre: str
+    length_ms: int
+    size: int
+    bitrate: int
+    year: int
+    track_nr: int
+    tracks_total: int
+    ipod_location: str
+
+    @classmethod
+    def from_raw(cls, raw: idb.RawTrack) -> "TrackRow":
+        d = raw.display
+        return cls(
+            track_id=raw.track_id,
+            title=d.get("title", ""),
+            artist=d.get("artist", ""),
+            album=d.get("album", ""),
+            genre=d.get("genre", ""),
+            length_ms=d.get("length_ms", 0),
+            size=d.get("size", 0),
+            bitrate=d.get("bitrate", 0),
+            year=d.get("year", 0),
+            track_nr=d.get("track_nr", 0),
+            tracks_total=d.get("tracks_total", 0),
+            ipod_location=d.get("ipod_location", ""),
+        )
+
+
+def _pick_music_folder(music_dir: Path) -> Path:
+    existing = sorted(p for p in music_dir.glob("F*") if p.is_dir()) if music_dir.exists() else []
+    if len(existing) < MUSIC_FOLDER_COUNT:
+        existing = []
+        for i in range(MUSIC_FOLDER_COUNT):
+            f = music_dir / f"F{i:02d}"
+            f.mkdir(parents=True, exist_ok=True)
+            existing.append(f)
+    return random.choice(existing)
+
+
+def _random_ipod_filename(ext: str) -> str:
+    chars = string.ascii_uppercase + string.digits
+    return "".join(random.choices(chars, k=4)) + ext
+
+
+class Library:
+    def __init__(self, device: Device):
+        self.device = device
+        self.db: Optional[idb.ITunesDB] = None
+
+    def load(self) -> None:
+        data = self.device.itunesdb_path.read_bytes()
+        self.db = idb.ITunesDB.parse(data)
+
+    def list_tracks(self) -> list[TrackRow]:
+        assert self.db is not None
+        return [TrackRow.from_raw(t) for t in self.db.tracks]
+
+    def backup(self) -> Path:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        micros = f"{time.time() % 1:.6f}"[2:]
+        dest = self.device.backups_dir() / f"iTunesDB.{ts}-{micros}.bak"
+        shutil.copy2(self.device.itunesdb_path, dest)
+        return dest
+
+    def save(self) -> None:
+        assert self.db is not None
+        self.backup()
+        data = self.db.serialize()
+        tmp = self.device.itunesdb_path.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(self.device.itunesdb_path)
+        try:
+            os.sync()
+        except OSError:
+            pass
+
+    def import_file(self, src_path: Path, on_progress: Optional[Callable[[str], None]] = None) -> TrackRow:
+        assert self.db is not None
+        src_path = Path(src_path)
+
+        def report(msg: str) -> None:
+            if on_progress:
+                on_progress(msg)
+
+        report(f"Reading {src_path.name}")
+        info = audio_inspect.inspect(src_path)
+
+        work_path = src_path
+        tmpdir = None
+        if info.format == "flac":
+            report(f"Transcoding {src_path.name} (FLAC → ALAC, iPod can't play FLAC)")
+            tmpdir = tempfile.mkdtemp(prefix="ipodmanager-")
+            work_path = Path(tmpdir) / (src_path.stem + ".m4a")
+            try:
+                transcode.flac_to_alac(src_path, work_path)
+                info = audio_inspect.inspect(work_path)
+            except Exception:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                raise
+
+        try:
+            report(f"Copying {src_path.name} to device")
+            folder = _pick_music_folder(self.device.music_dir)
+            dest = None
+            for _ in range(50):
+                candidate = folder / _random_ipod_filename(work_path.suffix)
+                if not candidate.exists():
+                    dest = candidate
+                    break
+            if dest is None:
+                raise LibraryError("could not allocate a unique on-device filename")
+
+            shutil.copy2(work_path, dest)
+        finally:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+        rel = dest.relative_to(self.device.mount_root)
+        meta = idb.TrackMeta(
+            track_id=0,
+            dbid=0,
+            title=info.title or src_path.stem,
+            artist=info.artist,
+            album=info.album,
+            genre=info.genre,
+            composer=info.composer,
+            comment=info.comment,
+            filetype=FILETYPE_LABELS.get(info.format, "AAC audio file"),
+            ipod_location=idb.relpath_to_ipod_path(str(rel)),
+            size=dest.stat().st_size,
+            length_ms=info.length_ms,
+            track_nr=info.track_nr,
+            tracks_total=info.tracks_total,
+            disc_nr=info.disc_nr,
+            discs_total=info.discs_total,
+            year=info.year,
+            bitrate=info.bitrate,
+            samplerate=info.samplerate,
+            date_added=time.time(),
+        )
+        report(f"Adding {meta.title} to library")
+        raw = self.db.add_track(meta)
+        return TrackRow.from_raw(raw)
+
+    def delete_track(self, track_id: int) -> None:
+        assert self.db is not None
+        track = next((t for t in self.db.tracks if t.track_id == track_id), None)
+        if track is None:
+            return
+        rel = idb.ipod_path_to_relpath(track.display.get("ipod_location", ""))
+        if rel:
+            path = self.device.mount_root / rel
+            if path.exists():
+                path.unlink()
+        self.db.remove_track(track_id)

@@ -1,0 +1,108 @@
+"""Round-trip tests for the iTunesDB binary parser/writer.
+
+These use a synthetic (but format-correct) mhbd, built the same way real
+iTunes would, since we don't have a real device dump available in CI. They
+verify the parser/writer is self-consistent; final confidence still comes
+from testing against a real device (see README).
+"""
+
+import struct
+
+from ipodmanager.db import itunesdb as idb
+
+from .helpers import build_empty_mhbd
+
+
+def test_parse_empty_db():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    assert db.tracks == []
+    assert db.playlists == []
+
+
+def test_add_track_roundtrip():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    meta = idb.TrackMeta(
+        track_id=0,
+        dbid=0,
+        title="Test Song",
+        artist="Test Artist",
+        album="Test Album",
+        genre="Rock",
+        ipod_location=idb.relpath_to_ipod_path("iPod_Control/Music/F00/TEST.m4a"),
+        size=123456,
+        length_ms=180000,
+        track_nr=3,
+        tracks_total=12,
+        year=2024,
+        bitrate=256,
+        samplerate=44100,
+    )
+    db.add_track(meta)
+    assert len(db.tracks) == 1
+    assert len(db.master_playlist().mhip_track_ids) == 1
+
+    serialized = db.serialize()
+    db2 = idb.ITunesDB.parse(serialized)
+    assert len(db2.tracks) == 1
+    t = db2.tracks[0]
+    assert t.display["title"] == "Test Song"
+    assert t.display["artist"] == "Test Artist"
+    assert t.display["album"] == "Test Album"
+    assert t.display["genre"] == "Rock"
+    assert t.display["ipod_location"] == ":iPod_Control:Music:F00:TEST.m4a"
+    assert t.display["size"] == 123456
+    assert t.display["length_ms"] == 180000
+    assert t.display["track_nr"] == 3
+    assert t.display["tracks_total"] == 12
+    assert t.display["year"] == 2024
+    assert t.display["bitrate"] == 256
+    assert db2.master_playlist().mhip_track_ids == [t.track_id]
+
+
+def test_delete_track_removes_playlist_reference():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    ids = []
+    for i in range(3):
+        meta = idb.TrackMeta(
+            track_id=0, dbid=0, title=f"Song {i}",
+            ipod_location=idb.relpath_to_ipod_path(f"iPod_Control/Music/F00/S{i}.m4a"),
+        )
+        ids.append(db.add_track(meta).track_id)
+
+    victim = ids[1]
+    assert db.remove_track(victim) is True
+    assert victim not in [t.track_id for t in db.tracks]
+    assert victim not in db.master_playlist().mhip_track_ids
+    assert len(db.tracks) == 2
+
+    # round-trip again after the delete
+    db2 = idb.ITunesDB.parse(db.serialize())
+    assert len(db2.tracks) == 2
+    assert victim not in db2.master_playlist().mhip_track_ids
+
+
+def test_unknown_mhsd_sections_are_preserved_verbatim():
+    base = build_empty_mhbd()
+    # splice in a fake, unrecognized mhsd section (index 4, "album list")
+    # the way real iTunes does -- we should copy it through unmodified.
+    fake_index4 = struct.pack("<4siii", b"mhsd", 96, 96 + 16, 4) + b"\x00" * 80 + b"SOME_OPAQUE_DATA"
+    header = bytearray(base)
+    mhbd_header_len = struct.unpack_from("<I", header, 4)[0]
+    new_buf = bytes(header[:mhbd_header_len]) + bytes(header[mhbd_header_len:]) + fake_index4
+    struct.pack_into("<I", new_buf := bytearray(new_buf), 0x14, 3)
+    struct.pack_into("<I", new_buf, 8, len(new_buf))
+
+    db = idb.ITunesDB.parse(bytes(new_buf))
+    assert len(db.sections) == 3
+    kind, raw = db.sections[2]
+    assert kind == "raw"
+    assert raw == fake_index4
+
+    reserialized = db.serialize()
+    db2 = idb.ITunesDB.parse(reserialized)
+    assert db2.sections[2] == ("raw", fake_index4)
+
+
+def test_ipod_path_conversion():
+    assert idb.relpath_to_ipod_path("iPod_Control/Music/F00/A.m4a") == ":iPod_Control:Music:F00:A.m4a"
+    assert idb.ipod_path_to_relpath(":iPod_Control:Music:F00:A.m4a") == "iPod_Control/Music/F00/A.m4a"
