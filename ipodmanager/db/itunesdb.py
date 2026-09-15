@@ -590,11 +590,13 @@ MHBD_STRUCT = struct.Struct("<4sIIIII")  # up through num_children (offset 0x18)
 @dataclass
 class TracksSection:
     tracks: list[RawTrack]
+    index: int = 1  # this section's mhsd index, preserved from the source file (see parse())
 
 
 @dataclass
 class PlaylistsSection:
     playlists: list[RawPlaylist]
+    index: int = 2  # this section's mhsd index, preserved from the source file (see parse())
 
 
 # A parsed mhbd child is either a section we understand and can mutate, or
@@ -645,21 +647,59 @@ class ITunesDB:
         raw_body = bytes(buf[header_len:])
         body = zlib.decompress(raw_body) if unknown1 == 2 else raw_body
 
+        # First pass: walk every top-level mhsd chunk and note each one's
+        # `index` field alongside the magic of its own inner container
+        # (mhlt = track list, mhlp = playlist list). libgpod's classic-iPod
+        # source (and this module's own original implementation) treats
+        # index 1/2 as tracks/playlists, which holds for classic click-wheel
+        # devices -- but a real iPhone 3G on newer firmware (confirmed:
+        # iTunesDB version 110) was found using index 3 for its actual
+        # playlist list and index 5 for a second, always-empty mhlp-shaped
+        # section holding Apple's built-in library category placeholders
+        # (Music/Movies/TV Shows/Audiobooks/Tones/Rentals/Books) -- so index
+        # alone isn't a reliable signal on every generation, but the inner
+        # magic always is.
         pos = 0
-        sections: list = []
-        max_track_id = 0
-        max_dbid = 0
-        have_tracks = False
-        have_playlists = False
-
+        chunks = []  # (index, inner_magic, body_start, body_end, chunk_start)
         for _ in range(num_children):
             mhsd_magic, mhsd_header_len, mhsd_total_len, index = struct.unpack_from("<4siii", body, pos)
             if mhsd_magic != b"mhsd":
                 raise ValueError(f"expected mhsd at {pos}, found {mhsd_magic!r}")
             body_start = pos + mhsd_header_len
             body_end = pos + mhsd_total_len
+            chunks.append((index, body[body_start : body_start + 4], body_start, body_end, pos))
+            pos = body_end
 
-            if index == 1 and not have_tracks:  # track list
+        # Parse every mhlp-shaped chunk up front so we can pick the one
+        # that's actually the real playlist list -- a device can have more
+        # than one (see above), and the real one is identified by having a
+        # master/MPL playlist in it; the placeholder one never does.
+        playlist_candidates = []  # (chunk position in `chunks`, list[RawPlaylist])
+        for i, (_index, inner_magic, body_start, _body_end, _chunk_start) in enumerate(chunks):
+            if inner_magic != b"mhlp":
+                continue
+            _magic, mhlp_header_len, num_pl = struct.unpack_from("<4sii", body, body_start)
+            ppos = body_start + mhlp_header_len
+            playlists: list[RawPlaylist] = []
+            for _ in range(num_pl):
+                pl = parse_mhyp(body, ppos)
+                playlists.append(pl)
+                plen = struct.unpack_from("<I", body, ppos + 8)[0]
+                ppos += plen
+            playlist_candidates.append((i, playlists))
+
+        chosen_playlists_chunk = None
+        if playlist_candidates:
+            with_master = [c for c in playlist_candidates if any(p.is_master for p in c[1])]
+            chosen_playlists_chunk = (with_master or playlist_candidates)[0][0]
+
+        sections: list = []
+        max_track_id = 0
+        max_dbid = 0
+        have_tracks = False
+
+        for i, (index, inner_magic, body_start, body_end, chunk_start) in enumerate(chunks):
+            if inner_magic == b"mhlt" and not have_tracks:  # track list
                 have_tracks = True
                 _magic, mhlt_header_len, num_songs = struct.unpack_from("<4sii", body, body_start)
                 tpos = body_start + mhlt_header_len
@@ -671,24 +711,15 @@ class ITunesDB:
                     max_dbid = max(max_dbid, t.display.get("dbid", 0))
                     total_track_len = struct.unpack_from("<I", body, tpos + 8)[0]
                     tpos += total_track_len
-                sections.append(TracksSection(tracks=tracks))
-            elif index == 2 and not have_playlists:  # playlists
-                have_playlists = True
-                _magic, mhlp_header_len, num_pl = struct.unpack_from("<4sii", body, body_start)
-                ppos = body_start + mhlp_header_len
-                playlists: list[RawPlaylist] = []
-                for _ in range(num_pl):
-                    pl = parse_mhyp(body, ppos)
-                    playlists.append(pl)
-                    plen = struct.unpack_from("<I", body, ppos + 8)[0]
-                    ppos += plen
-                sections.append(PlaylistsSection(playlists=playlists))
+                sections.append(TracksSection(tracks=tracks, index=index))
+            elif i == chosen_playlists_chunk:
+                playlists = next(pls for idx, pls in playlist_candidates if idx == i)
+                sections.append(PlaylistsSection(playlists=playlists, index=index))
             else:
-                # Unknown or duplicate-index section (album/artist index,
-                # Genius, podcasts, categorized playlists, ...): preserve
-                # verbatim.
-                sections.append(("raw", bytes(body[pos:body_end])))
-            pos = body_end
+                # Unknown/unhandled section (album/artist index, Genius,
+                # podcasts, a second mhlt/mhlp we didn't pick, ...):
+                # preserve verbatim, index and all.
+                sections.append(("raw", bytes(body[chunk_start:body_end])))
 
         return cls(
             version=version,
@@ -795,11 +826,11 @@ class ITunesDB:
             if isinstance(s, TracksSection):
                 mhlt_body = struct.pack("<4sii", b"mhlt", 92, len(s.tracks)) + b"\x00" * 80
                 mhlt_body += b"".join(t.raw for t in s.tracks)
-                parts.append(struct.pack("<4siii", b"mhsd", 96, 96 + len(mhlt_body), 1) + b"\x00" * 80 + mhlt_body)
+                parts.append(struct.pack("<4siii", b"mhsd", 96, 96 + len(mhlt_body), s.index) + b"\x00" * 80 + mhlt_body)
             elif isinstance(s, PlaylistsSection):
                 mhlp_body = struct.pack("<4sii", b"mhlp", 92, len(s.playlists)) + b"\x00" * 80
                 mhlp_body += b"".join(pl.serialize() for pl in s.playlists)
-                parts.append(struct.pack("<4siii", b"mhsd", 96, 96 + len(mhlp_body), 2) + b"\x00" * 80 + mhlp_body)
+                parts.append(struct.pack("<4siii", b"mhsd", 96, 96 + len(mhlp_body), s.index) + b"\x00" * 80 + mhlp_body)
             else:
                 _kind, raw = s
                 parts.append(raw)

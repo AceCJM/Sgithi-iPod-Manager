@@ -104,6 +104,72 @@ def test_unknown_mhsd_sections_are_preserved_verbatim():
     assert db2.sections[2] == ("raw", fake_index4)
 
 
+def test_playlists_at_nonstandard_index_are_found_by_magic():
+    """A real iPhone 3G (iTunesDB version 110) was found writing its real
+    playlist list at mhsd index 3, not the classic index 2 -- with a
+    second, always-empty mhlp-shaped section at index 5 holding Apple's
+    built-in library category placeholders (Music/Movies/TV Shows/...).
+    The parser must find the real one by its inner 'mhlp' magic (not by
+    index), must not treat the placeholder list as real playlists, and
+    must preserve every section's original index number on write-back --
+    silently renumbering to the classic 1/2 convention would desync this
+    device's own firmware expectations.
+    """
+    track_raw = idb.build_new_mhit(idb.TrackMeta(
+        track_id=1, dbid=1, title="Song One",
+        ipod_location=idb.relpath_to_ipod_path("iTunes_Control/Music/F00/A.m4a"),
+    ))
+
+    master = idb.build_new_master_playlist("iPhone")
+    master.add_track(1)
+    user_pl = idb.build_new_playlist("Road Trip")
+    user_pl.add_track(1)
+
+    placeholder_names = ["Music", "Movies", "TV Shows", "Audiobooks", "Tones", "Rentals", "Books"]
+    placeholders = [idb.build_new_playlist(n) for n in placeholder_names]
+
+    def mhsd(index: int, inner_body: bytes) -> bytes:
+        return struct.pack("<4siii", b"mhsd", 96, 96 + len(inner_body), index) + b"\x00" * 80 + inner_body
+
+    def mhlt(tracks_raw: list) -> bytes:
+        return struct.pack("<4sii", b"mhlt", 92, len(tracks_raw)) + b"\x00" * 80 + b"".join(tracks_raw)
+
+    def mhlp(playlists: list) -> bytes:
+        return struct.pack("<4sii", b"mhlp", 92, len(playlists)) + b"\x00" * 80 + b"".join(pl.serialize() for pl in playlists)
+
+    body = b"".join([
+        mhsd(1, mhlt([track_raw])),
+        mhsd(3, mhlp([master, user_pl])),
+        mhsd(5, mhlp(placeholders)),
+    ])
+    header = bytearray(b"\x00" * 244)
+    struct.pack_into("<4sIIII", header, 0, b"mhbd", 244, 244 + len(body), 1, 110)
+    struct.pack_into("<I", header, 0x14, 3)
+    data = bytes(header) + body
+
+    db = idb.ITunesDB.parse(data)
+    assert len(db.tracks) == 1
+    names = {p.title() for p in db.playlists}
+    assert "Road Trip" in names
+    assert not any(n in names for n in placeholder_names)
+    assert db.master_playlist().title() == "iPhone"
+
+    reserialized = db.serialize()
+    header_len = struct.unpack_from("<I", reserialized, 4)[0]
+    pos = header_len
+    seen_indices = []
+    while pos < len(reserialized):
+        _magic, mhsd_total_len, index = struct.unpack_from("<iii", reserialized, pos + 4)
+        seen_indices.append(index)
+        pos += mhsd_total_len
+    assert seen_indices == [1, 3, 5]
+
+    db2 = idb.ITunesDB.parse(reserialized)
+    names2 = {p.title() for p in db2.playlists}
+    assert "Road Trip" in names2
+    assert not any(n in names2 for n in placeholder_names)
+
+
 def test_ipod_path_conversion():
     assert idb.relpath_to_ipod_path("iPod_Control/Music/F00/A.m4a") == ":iPod_Control:Music:F00:A.m4a"
     assert idb.ipod_path_to_relpath(":iPod_Control:Music:F00:A.m4a") == "iPod_Control/Music/F00/A.m4a"

@@ -11,11 +11,12 @@ gi.require_version("Gio", "2.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from ..library import Library, PlaylistRow, discover_audio_files
+from ..db import itunesdb as idb
+from ..library import Library, PlaylistRow, TrackRow, discover_audio_files
 from ..settings import Settings
 from ..transport import classic, iphone
 from ..transport.base import Device
-from .track_object import TrackObject
+from .track_object import TrackObject, _fmt_duration, _fmt_size
 
 SUPPORTED_EXTENSIONS = [".flac", ".m4a", ".mp4", ".m4b"]
 M3U_EXTENSIONS = [".m3u", ".m3u8"]
@@ -201,6 +202,9 @@ class IPodWindow(Adw.ApplicationWindow):
             label = Gtk.Label(xalign=0)
             label.set_ellipsize(3)  # Pango.EllipsizeMode.END
             list_item.set_child(label)
+            gesture = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+            gesture.connect("pressed", self._on_track_right_click, list_item)
+            label.add_controller(gesture)
 
         def bind(_factory, list_item):
             label = list_item.get_child()
@@ -327,6 +331,9 @@ class IPodWindow(Adw.ApplicationWindow):
         box.append(delete_button)
 
         row.set_child(box)
+        gesture = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        gesture.connect("pressed", self._on_playlist_right_click, pl)
+        row.add_controller(gesture)
         return row
 
     def _make_playlist_thumbnail(self, pl: PlaylistRow) -> Gtk.Widget:
@@ -353,7 +360,10 @@ class IPodWindow(Adw.ApplicationWindow):
             self.stack.set_visible_child_name("tracks")
 
     def _on_playlist_row_activated(self, _listbox, row: Gtk.ListBoxRow) -> None:
-        self._active_playlist = row.playlist
+        self._open_playlist(row.playlist)
+
+    def _open_playlist(self, pl: PlaylistRow) -> None:
+        self._active_playlist = pl
         self._reload_track_list()
         self.playlists_toggle.set_active(False)
         self.stack.set_visible_child_name("tracks")
@@ -377,6 +387,108 @@ class IPodWindow(Adw.ApplicationWindow):
         self.delete_button.set_sensitive(has_selection)
         self.add_to_playlist_button.set_sensitive(has_selection)
         self.remove_from_playlist_button.set_sensitive(has_selection and self._active_playlist is not None)
+
+    # -- context menus -----------------------------------------------------
+
+    def _popover_menu(self, items: list, destructive_labels: set | None = None) -> Gtk.Popover:
+        """Builds a small popover menu (matching the "Add Music" popover's
+        own look) from a list of (label, callback) pairs -- a (None, None)
+        pair renders as a separator instead of a row."""
+        destructive_labels = destructive_labels or set()
+        popover = Gtk.Popover()
+        popover.connect("closed", lambda p: p.unparent())
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        for label, callback in items:
+            if label is None:
+                box.append(Gtk.Separator())
+                continue
+            button = Gtk.Button(label=label, has_frame=False)
+            button.set_halign(Gtk.Align.FILL)
+            child = button.get_child()
+            if isinstance(child, Gtk.Label):
+                child.set_xalign(0)
+            if label in destructive_labels:
+                button.add_css_class("destructive-action")
+
+            def handler(_button, cb=callback):
+                popover.popdown()
+                cb()
+
+            button.connect("clicked", handler)
+            box.append(button)
+        popover.set_child(box)
+        return popover
+
+    def _popup_context_menu(self, widget: Gtk.Widget, x: float, y: float, items: list, destructive_labels=None) -> None:
+        popover = self._popover_menu(items, destructive_labels=destructive_labels)
+        popover.set_parent(widget)
+        popover.set_pointing_to(Gdk.Rectangle(x=int(x), y=int(y), width=1, height=1))
+        popover.popup()
+
+    def _on_track_right_click(self, gesture: Gtk.GestureClick, _n_press: int, x: float, y: float, list_item: Gtk.ListItem) -> None:
+        pos = list_item.get_position()
+        if pos == Gtk.INVALID_LIST_POSITION:
+            return
+        if not self.selection_model.is_selected(pos):
+            self.selection_model.select_item(pos, True)
+        obj: TrackObject = list_item.get_item()
+        track_ids = self._selected_track_ids()
+        if not track_ids:
+            return
+        n = len(track_ids)
+        suffix = f" {n} Tracks" if n > 1 else ""
+
+        items = []
+        if n == 1:
+            items.append(("Track Info…", lambda: self._show_track_info(obj.row)))
+            items.append((None, None))
+        items.append(("Add to Playlist…", lambda: self._on_add_to_playlist_clicked(None)))
+        if self._active_playlist is not None:
+            items.append(("Remove from Playlist", lambda: self._on_remove_from_playlist_clicked(None)))
+        items.append((None, None))
+        delete_label = f"Delete{suffix}"
+        items.append((delete_label, lambda: self.on_delete_clicked(None)))
+
+        self._popup_context_menu(gesture.get_widget(), x, y, items, destructive_labels={delete_label})
+
+    def _show_track_info(self, row: TrackRow) -> None:
+        fields = [
+            ("Title", row.title or "(untitled)"),
+            ("Artist", row.artist),
+            ("Album", row.album),
+            ("Genre", row.genre),
+            ("Track", f"{row.track_nr}/{row.tracks_total}" if row.track_nr or row.tracks_total else ""),
+            ("Year", str(row.year) if row.year else ""),
+            ("Duration", _fmt_duration(row.length_ms)),
+            ("Bitrate", f"{row.bitrate} kbps" if row.bitrate else ""),
+            ("Size", _fmt_size(row.size)),
+            ("Location", idb.ipod_path_to_relpath(row.ipod_location)),
+        ]
+        grid = Gtk.Grid(row_spacing=6, column_spacing=16)
+        for i, (name, value) in enumerate(fields):
+            name_label = Gtk.Label(label=name, xalign=0)
+            name_label.add_css_class("dim-label")
+            value_label = Gtk.Label(label=value or "—", xalign=0)
+            value_label.set_selectable(True)
+            value_label.set_wrap(True)
+            value_label.set_hexpand(True)
+            grid.attach(name_label, 0, i, 1, 1)
+            grid.attach(value_label, 1, i, 1, 1)
+
+        dialog = Adw.AlertDialog(heading="Track Info")
+        dialog.set_extra_child(grid)
+        dialog.add_response("close", "Close")
+        dialog.set_default_response("close")
+        dialog.present(self)
+
+    def _on_playlist_right_click(self, gesture: Gtk.GestureClick, _n_press: int, x: float, y: float, pl: PlaylistRow) -> None:
+        items = [
+            ("Open Playlist", lambda: self._open_playlist(pl)),
+            (None, None),
+            ("Rename…", lambda: self._on_rename_playlist_clicked(None, pl)),
+            ("Delete…", lambda: self._on_delete_playlist_clicked(None, pl)),
+        ]
+        self._popup_context_menu(gesture.get_widget(), x, y, items, destructive_labels={"Delete…"})
 
     # -- playlist editing --------------------------------------------------
 

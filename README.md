@@ -27,6 +27,10 @@ to ALAC on import, since no iPod firmware can actually decode FLAC.
   one (from the main track list's "Add to Playlist…", or "Remove from
   Playlist" while browsing one) — deleting a playlist only removes the
   playlist itself, never its member tracks or their files
+- Right-click context menus on both the track list and the Playlists view
+  — Track Info, Add to Playlist, Remove from Playlist, Delete on tracks;
+  Open, Rename, Delete on playlists — as a faster alternative to the
+  toolbar buttons
 - Optional "convert to AAC 320" setting (Preferences): when on, anything
   better than AAC 320kbps (lossless FLAC/ALAC, or lossy sources above
   320kbps) is re-encoded down to AAC 320kbps on import instead of kept
@@ -76,6 +80,37 @@ art (iPod Video 5/5.5G):**
   signing key doesn't match what's derivable from the device's own
   classic-format secret — a data inconsistency intrinsic to the specific
   test device, not a gap in this app's understanding of the format.
+
+- **Fixed:** playlists not showing up in this app's own Playlists view.
+  Root-caused against a real iPhone 3G: libgpod's classic-iPod source (and
+  this app's original parser) assumes the playlist list always lives in
+  the `mhsd` section with `index == 2`, but a real device on newer
+  firmware (confirmed: `iTunesDB` version 110) instead used `index == 3`
+  for its actual playlist list, with a second, always-empty `mhlp`-shaped
+  section at `index == 5` holding Apple's built-in library category
+  placeholders (Music/Movies/TV Shows/Audiobooks/Tones/Rentals/Books) —
+  which must *not* be shown as if they were real playlists. The parser
+  now identifies a track/playlist list section by the magic of its own
+  inner container (`mhlt`/`mhlp`) instead of trusting `index`, and among
+  multiple `mhlp`-shaped sections picks the one that actually contains a
+  master playlist. Each section's original `index` is preserved on
+  write-back (not renumbered to the classic 1/2 convention), so a device
+  using non-standard index numbers keeps working after a save. Covered by
+  `tests/test_itunesdb.py::test_playlists_at_nonstandard_index_are_found_by_magic`,
+  built from the real device's own diagnostic output (see below).
+
+  If playlists still don't show up after this fix, or tracks/playlists go
+  missing on some other device, run the read-only diagnostic below
+  against the device's actual database before assuming it's a new bug —
+  it walks the real on-disk section structure and prints what it finds,
+  including each playlist's title, master/regular flag, and track count:
+  ```
+  python -m ipodmanager.diagnose
+  ```
+  With the device connected over USB (and the app itself closed, so
+  nothing else has it mounted), this finds it, mounts it itself
+  read-only, and reports it. Share that output rather than the file
+  itself (it's your real library's metadata).
 
 **Not yet implemented:**
 
