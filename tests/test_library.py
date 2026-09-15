@@ -364,3 +364,30 @@ def test_add_and_remove_tracks_from_playlist(fake_device):
     lib2 = Library(fake_device)
     lib2.load()
     assert lib2.list_playlists()[0].track_ids == [t2]
+
+
+def test_delete_track_reports_stale_raw_section_reference(fake_device):
+    import struct
+
+    lib = Library(fake_device)
+    lib.load()
+    tid = _add_bare_track(lib, "Song")
+
+    # splice in a fake raw section (standing in for real iTunes's separate
+    # podcast-playlist copy, mhsd type 3) containing an mhip referencing
+    # this track -- same technique as test_itunesdb.py's equivalent test
+    mhip = idb.build_mhip(tid)
+    fake_section = struct.pack("<4siii", b"mhsd", 96, 96 + len(mhip), 3) + b"\x00" * 80 + mhip
+    serialized = bytearray(lib.db.serialize())
+    struct.pack_into("<I", serialized, 0x14, struct.unpack_from("<I", serialized, 0x14)[0] + 1)
+    serialized = bytes(serialized) + fake_section
+    lib.db = idb.ITunesDB.parse(bytes(serialized))
+
+    assert lib.delete_track(tid) is True  # stale reference detected, but delete still proceeds
+    assert lib.list_tracks() == []
+    lib.save()
+
+    lib2 = Library(fake_device)
+    lib2.load()
+    assert lib2.list_tracks() == []
+    assert lib2.db.has_stale_raw_reference(tid) is True  # left as-is, not silently dropped or rewritten

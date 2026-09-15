@@ -407,6 +407,37 @@ def build_mhip(track_id: int) -> bytes:
     return bytes(b)
 
 
+def raw_section_references_track(raw: bytes, track_id: int) -> bool:
+    """Best-effort, read-only check for whether `track_id` appears in an
+    mhip-shaped record anywhere inside an unrecognized/raw mhsd section
+    (see the Section/"raw" comment on ITunesDB.sections).
+
+    Real iTunes writes several mhsd sections beyond the tracks (1) and
+    playlists (2) ones this app actually parses -- browse indices, Genius
+    data, and (mhsd type 3) a second, separately-formatted copy of the
+    podcast playlist grouped by show/album (libgpod's write_podcast_mhips).
+    That last one is the only one that can end up with a stale reference
+    after a delete, since it's the only one built from real per-track
+    mhip records. We don't understand its enclosing structure well enough
+    to safely rewrite it (removing bytes from the middle of a section
+    with an internal layout we haven't verified risks corrupting it) --
+    this only detects the problem, generically, by scanning for the
+    fixed, well-known 76-byte mhip record shape (see build_mhip) and
+    checking its track_id field, so the caller can warn instead of
+    silently leaving a dangling reference.
+    """
+    start = 0
+    while True:
+        idx = raw.find(b"mhip", start)
+        if idx == -1:
+            return False
+        if idx + MHIP_HEADER_LEN <= len(raw):
+            tid = struct.unpack_from("<I", raw, idx + 0x18)[0]
+            if tid == track_id:
+                return True
+        start = idx + 4
+
+
 @dataclass
 class RawPlaylist:
     is_master: bool
@@ -736,13 +767,25 @@ class ITunesDB:
                 removed = removed or len(s.tracks) != before
         # Note: this only scrubs the dangling reference from playlists we
         # actually parse (the regular playlist list, index 2). Any raw/
-        # unknown section (e.g. a podcast playlist list) that happens to
-        # reference this track ID is left untouched -- see module
-        # docstring. That's a stale reference in a supplemental index, not
-        # a source of truth, so it isn't corrupting.
+        # unknown section (e.g. real iTunes's separately-formatted podcast
+        # playlist copy, mhsd type 3) that happens to reference this track
+        # ID is left untouched -- see module docstring, and
+        # has_stale_raw_reference() below for detecting (not fixing) this.
         for pl in self.playlists:
             pl.remove_track(track_id)
         return removed
+
+    def has_stale_raw_reference(self, track_id: int) -> bool:
+        """True if some raw/unrecognized section (see the Section comment
+        above) still references this track ID -- a caller should warn
+        about this rather than assume a delete fully cleaned up. Purely a
+        read-only check; see raw_section_references_track()'s docstring
+        for why this app doesn't try to fix it automatically."""
+        for s in self.sections:
+            if isinstance(s, tuple) and s[0] == "raw":
+                if raw_section_references_track(s[1], track_id):
+                    return True
+        return False
 
     def serialize(self) -> bytes:
         # mhlt/mhlp/mhsd header sizes (92 / 92 / 96) and the zero-padding

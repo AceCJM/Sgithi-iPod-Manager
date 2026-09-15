@@ -82,11 +82,18 @@ art (iPod Video 5/5.5G):**
 - iPod 3G artwork: it has no color screen, so `ArtworkDB` writing is only
   ever attempted for the iPod Video 5/5.5G generation this app targets.
 - Any `mhsd` section this app doesn't understand (album/artist browse
-  indices, Genius data, podcast/categorized playlist lists) is preserved
-  byte-for-byte on write, not regenerated. If your library uses podcasts
-  specifically, deleting a track won't scrub it from a podcast playlist's
-  membership list (a stale reference in a section this app doesn't
-  interpret, not a source of playback truth).
+  indices, Genius data, and real iTunes's separately-formatted duplicate
+  of the podcast playlist grouped by show/album, mhsd type 3) is preserved
+  byte-for-byte on write, not regenerated. Deleting a track fully scrubs
+  it from the tracks list and every playlist this app actually parses
+  (including a podcast playlist's *regular* entry, which is what the
+  device firmware itself plays from) -- but if that same track is also
+  referenced inside one of those unrecognized sections, that copy is left
+  stale rather than risk corrupting a section whose full layout hasn't
+  been verified. The app detects this (by scanning for the track's ID in
+  a well-known, fixed-size record shape, without needing to understand
+  the section's full structure) and warns you when it happens, rather
+  than silently claiming full cleanup.
 
 ## Setup
 
@@ -144,6 +151,10 @@ pip install pymobiledevice3
   (`src/db-itunes-parser.h`, `src/itdb_itunesdb.c`, GNU LGPL-2.1+) rather
   than reconstructed from memory. Also handles the zlib-compressed body
   variant of this same format used by iPhone-generation devices.
+  `has_stale_raw_reference()`/`raw_section_references_track()` give a
+  read-only, best-effort way to detect (not fix) a deleted track still
+  referenced inside a section this app doesn't parse, without needing to
+  understand that section's full layout.
 - **`ipodmanager/db/artworkdb.py`** — writes the classic iPod's `ArtworkDB`
   + `.ithmb` thumbnail files (cover art). Same "transliterated from
   libgpod's actual C source, not reconstructed from memory" standard as

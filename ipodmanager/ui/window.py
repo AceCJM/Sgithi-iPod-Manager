@@ -695,12 +695,22 @@ class IPodWindow(Adw.ApplicationWindow):
         if response != "delete":
             return
         assert self.library is not None
+        any_stale = False
         try:
             for tid in track_ids:
-                self.library.delete_track(tid)
+                if self.library.delete_track(tid):
+                    any_stale = True
             self.library.save()
         except Exception as e:  # noqa: BLE001
             self._show_error(f"Couldn't delete: {e}")
         self._reload_track_list()
         self._reload_playlists_list()
         self.toast(f"Deleted {len(track_ids)} track{'s' if len(track_ids) != 1 else ''}")
+        if any_stale:
+            self._show_error(
+                "One or more deleted tracks were still referenced in a part of this iPod's database this "
+                "app doesn't fully understand (most likely a podcast playlist real iTunes wrote separately). "
+                "That reference was left as-is rather than risk corrupting a section this app can't safely "
+                "rewrite -- if you use podcasts on this device, a future re-sync with real iTunes will clean "
+                "it up."
+            )

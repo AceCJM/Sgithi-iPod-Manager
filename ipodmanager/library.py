@@ -470,17 +470,26 @@ class Library:
         for name, data in result.ithmb_files.items():
             (artwork_dir / name).write_bytes(data)
 
-    def delete_track(self, track_id: int) -> None:
+    def delete_track(self, track_id: int) -> bool:
+        """Deletes a track and its on-device file. Returns True if a
+        reference to it was found left behind in an unrecognized section
+        of the database (see ITunesDB.has_stale_raw_reference) -- most
+        commonly real iTunes's separate podcast-playlist copy -- which
+        this app can't safely rewrite; the caller should warn about that
+        rather than assume cleanup was 100% complete.
+        """
         assert self.db is not None
         track = next((t for t in self.db.tracks if t.track_id == track_id), None)
         if track is None:
-            return
+            return False
         rel = idb.ipod_path_to_relpath(track.display.get("ipod_location", ""))
         if rel:
             path = self.device.mount_root / rel
             if path.exists():
                 path.unlink()
+        has_stale_ref = self.db.has_stale_raw_reference(track_id)
         self.db.remove_track(track_id)
+        return has_stale_ref
 
     # -- playlist editing --------------------------------------------------
     # Playlist membership doesn't touch tracks/files on device or artwork,

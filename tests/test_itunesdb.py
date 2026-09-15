@@ -230,3 +230,52 @@ def test_delete_playlist_refuses_master():
     master = db.master_playlist()
     assert db.delete_playlist(master) is False
     assert db.master_playlist() is master
+
+
+def _splice_raw_section_with_mhip(base: bytes, track_id: int, index: int = 3) -> bytes:
+    """Same splicing technique as test_unknown_mhsd_sections_are_preserved_verbatim,
+    but the payload is a real (fixed-shape) mhip record referencing track_id --
+    standing in for real iTunes's mhsd type 3 (separately-formatted podcast
+    playlist copy), the one raw section type that can hold a stale reference.
+    """
+    mhip = idb.build_mhip(track_id)
+    fake_section = struct.pack("<4siii", b"mhsd", 96, 96 + len(mhip), index) + b"\x00" * 80 + mhip
+    header_len = struct.unpack_from("<I", base, 4)[0]
+    new_buf = bytearray(base) + fake_section
+    struct.pack_into("<I", new_buf, 0x14, 3)  # num_children: was 2, now 3
+    struct.pack_into("<I", new_buf, 8, len(new_buf))
+    return bytes(new_buf)
+
+
+def test_has_stale_raw_reference_detects_mhip_in_unknown_section():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    t = db.add_track(idb.TrackMeta(track_id=0, dbid=0, title="A", ipod_location=idb.relpath_to_ipod_path("iPod_Control/Music/F00/A.m4a")))
+
+    spliced = _splice_raw_section_with_mhip(db.serialize(), t.track_id)
+    db2 = idb.ITunesDB.parse(spliced)
+
+    assert db2.has_stale_raw_reference(t.track_id) is True
+    assert db2.has_stale_raw_reference(t.track_id + 999) is False
+
+
+def test_has_stale_raw_reference_false_when_no_raw_sections_reference_it():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    t = db.add_track(idb.TrackMeta(track_id=0, dbid=0, title="A", ipod_location=idb.relpath_to_ipod_path("iPod_Control/Music/F00/A.m4a")))
+    assert db.has_stale_raw_reference(t.track_id) is False
+
+
+def test_delete_track_reports_stale_raw_reference_without_modifying_it():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    t = db.add_track(idb.TrackMeta(track_id=0, dbid=0, title="A", ipod_location=idb.relpath_to_ipod_path("iPod_Control/Music/F00/A.m4a")))
+
+    spliced = _splice_raw_section_with_mhip(db.serialize(), t.track_id)
+    db2 = idb.ITunesDB.parse(spliced)
+    raw_before = db2.sections[2][1]
+
+    assert db2.has_stale_raw_reference(t.track_id) is True
+    db2.remove_track(t.track_id)
+    # the real track/playlist references are gone...
+    assert t.track_id not in [tr.track_id for tr in db2.tracks]
+    # ...but the raw section is deliberately left untouched (not rewritten)
+    assert db2.sections[2][1] == raw_before
+    assert db2.has_stale_raw_reference(t.track_id) is True
