@@ -437,6 +437,34 @@ class RawPlaylist:
             pos += mlen
         return ""
 
+    def set_title(self, name: str) -> None:
+        """Replace the TITLE mhod in body_before_mhips (in place, keeping
+        any other leading mhods -- e.g. a sort-key cache real iTunes may
+        have written on the master playlist -- untouched). Falls back to
+        prepending a new TITLE mhod (and bumping header_prefix's mhod
+        count) in the pathological case where one isn't already present.
+        """
+        pos = 0
+        new_body = bytearray()
+        replaced = False
+        while pos < len(self.body_before_mhips):
+            mtype, _text, mlen = parse_mhod(self.body_before_mhips, pos)
+            if mtype == MhodType.TITLE:
+                new_body += pack_mhod_string(MhodType.TITLE, name)
+                replaced = True
+            else:
+                new_body += self.body_before_mhips[pos : pos + mlen]
+            pos += mlen
+
+        if not replaced:
+            new_body = bytearray(pack_mhod_string(MhodType.TITLE, name)) + new_body
+            header = bytearray(self.header_prefix)
+            num_mhod = struct.unpack_from("<I", header, 0x0C)[0]
+            struct.pack_into("<I", header, 0x0C, num_mhod + 1)
+            self.header_prefix = bytes(header)
+
+        self.body_before_mhips = bytes(new_body)
+
     def serialize(self) -> bytes:
         body = self.header_prefix + self.body_before_mhips + b"".join(self.mhip_blobs)
         total_len = len(body)
@@ -671,6 +699,17 @@ class ITunesDB:
                 return pl
         self.sections.append(PlaylistsSection(playlists=[pl]))
         return pl
+
+    def delete_playlist(self, playlist: RawPlaylist) -> bool:
+        """Remove a (non-master) playlist. Does not touch its member
+        tracks or their files -- this only removes the playlist itself."""
+        if playlist.is_master:
+            return False
+        for s in self.sections:
+            if isinstance(s, PlaylistsSection) and playlist in s.playlists:
+                s.playlists.remove(playlist)
+                return True
+        return False
 
     def add_track(self, meta: TrackMeta) -> RawTrack:
         meta.track_id = self.next_track_id

@@ -23,6 +23,10 @@ to ALAC on import, since no iPod firmware can actually decode FLAC.
   imported (if not already present) and a real on-device playlist is
   created (or reused, if one with that name already exists) containing
   them
+- Rename or delete a playlist, and add/remove individual tracks to/from
+  one (from the main track list's "Add to Playlist…", or "Remove from
+  Playlist" while browsing one) — deleting a playlist only removes the
+  playlist itself, never its member tracks or their files
 - Optional "convert to AAC 320" setting (Preferences): when on, anything
   better than AAC 320kbps (lossless FLAC/ALAC, or lossy sources above
   320kbps) is re-encoded down to AAC 320kbps on import instead of kept
@@ -75,8 +79,6 @@ art (iPod Video 5/5.5G):**
 
 **Not yet implemented:**
 
-- Editing or deleting a playlist from within the app (only creating one via
-  M3U import, or having existing ones round-trip untouched).
 - iPod 3G artwork: it has no color screen, so `ArtworkDB` writing is only
   ever attempted for the iPod Video 5/5.5G generation this app targets.
 - Any `mhsd` section this app doesn't understand (album/artist browse

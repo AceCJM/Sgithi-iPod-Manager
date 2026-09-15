@@ -481,3 +481,45 @@ class Library:
             if path.exists():
                 path.unlink()
         self.db.remove_track(track_id)
+
+    # -- playlist editing --------------------------------------------------
+    # Playlist membership doesn't touch tracks/files on device or artwork,
+    # so unlike import_paths/import_playlist these don't call
+    # rebuild_artwork_db() -- just save().
+
+    def rename_playlist(self, name: str, new_name: str) -> None:
+        assert self.db is not None
+        pl = self.db.find_playlist_by_name(name)
+        if pl is None:
+            raise LibraryError(f"No playlist named {name!r}")
+        pl.set_title(new_name)
+        self.save()
+
+    def delete_playlist(self, name: str) -> None:
+        assert self.db is not None
+        pl = self.db.find_playlist_by_name(name)
+        if pl is None:
+            return
+        self.db.delete_playlist(pl)
+        self.save()
+
+    def add_tracks_to_playlist(self, name: str, track_ids: list[int]) -> None:
+        """Adds to a playlist with this name, creating it if it doesn't
+        exist yet (matching import_playlist's behavior)."""
+        assert self.db is not None
+        pl = self.db.get_or_create_playlist(name)
+        existing = set(pl.mhip_track_ids)
+        for tid in track_ids:
+            if tid not in existing:
+                pl.add_track(tid)
+                existing.add(tid)
+        self.save()
+
+    def remove_tracks_from_playlist(self, name: str, track_ids: list[int]) -> None:
+        assert self.db is not None
+        pl = self.db.find_playlist_by_name(name)
+        if pl is None:
+            return
+        for tid in track_ids:
+            pl.remove_track(tid)
+        self.save()

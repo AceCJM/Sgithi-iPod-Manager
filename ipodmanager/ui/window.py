@@ -67,6 +67,11 @@ class IPodWindow(Adw.ApplicationWindow):
         self.delete_button.set_sensitive(False)
         header.pack_start(self.delete_button)
 
+        self.add_to_playlist_button = Gtk.Button(label="Add to Playlist…")
+        self.add_to_playlist_button.set_sensitive(False)
+        self.add_to_playlist_button.connect("clicked", self._on_add_to_playlist_clicked)
+        header.pack_start(self.add_to_playlist_button)
+
         self.playlists_toggle = Gtk.ToggleButton(label="Playlists")
         self.playlists_toggle.set_sensitive(False)
         self.playlists_toggle.connect("toggled", self._on_playlists_toggled)
@@ -125,9 +130,13 @@ class IPodWindow(Adw.ApplicationWindow):
         self.playlist_filter_label = Gtk.Label(xalign=0)
         self.playlist_filter_label.add_css_class("title-4")
         self.playlist_filter_label.set_hexpand(True)
+        self.remove_from_playlist_button = Gtk.Button(label="Remove from Playlist")
+        self.remove_from_playlist_button.set_sensitive(False)
+        self.remove_from_playlist_button.connect("clicked", self._on_remove_from_playlist_clicked)
         show_all_button = Gtk.Button(label="Show All Tracks")
         show_all_button.connect("clicked", self._on_show_all_tracks_clicked)
         self.playlist_filter_bar.append(self.playlist_filter_label)
+        self.playlist_filter_bar.append(self.remove_from_playlist_button)
         self.playlist_filter_bar.append(show_all_button)
         self.playlist_filter_bar.set_visible(False)
 
@@ -276,6 +285,7 @@ class IPodWindow(Adw.ApplicationWindow):
             self.playlist_filter_bar.set_visible(True)
         else:
             self.playlist_filter_bar.set_visible(False)
+        self.on_selection_changed()
 
     def _reload_playlists_list(self) -> None:
         row = self.playlists_listbox.get_row_at_index(0)
@@ -302,7 +312,20 @@ class IPodWindow(Adw.ApplicationWindow):
         count_label.add_css_class("dim-label")
         labels.append(title_label)
         labels.append(count_label)
+        labels.set_hexpand(True)
         box.append(labels)
+
+        rename_button = Gtk.Button(icon_name="document-edit-symbolic", has_frame=False)
+        rename_button.set_tooltip_text("Rename playlist")
+        rename_button.connect("clicked", self._on_rename_playlist_clicked, pl)
+        box.append(rename_button)
+
+        delete_button = Gtk.Button(icon_name="user-trash-symbolic", has_frame=False)
+        delete_button.set_tooltip_text("Delete playlist")
+        delete_button.add_css_class("destructive-action")
+        delete_button.connect("clicked", self._on_delete_playlist_clicked, pl)
+        box.append(delete_button)
+
         row.set_child(box)
         return row
 
@@ -339,9 +362,136 @@ class IPodWindow(Adw.ApplicationWindow):
         self._active_playlist = None
         self._reload_track_list()
 
-    def on_selection_changed(self, *_args) -> None:
+    def _selected_track_ids(self) -> list[int]:
         bitset = self.selection_model.get_selection()
-        self.delete_button.set_sensitive(bitset.get_size() > 0)
+        track_ids = []
+        ok, it, pos = Gtk.BitsetIter.init_first(bitset)
+        while ok:
+            obj: TrackObject = self.store.get_item(pos)
+            track_ids.append(obj.track_id)
+            ok, pos = it.next()
+        return track_ids
+
+    def on_selection_changed(self, *_args) -> None:
+        has_selection = self.selection_model.get_selection().get_size() > 0
+        self.delete_button.set_sensitive(has_selection)
+        self.add_to_playlist_button.set_sensitive(has_selection)
+        self.remove_from_playlist_button.set_sensitive(has_selection and self._active_playlist is not None)
+
+    # -- playlist editing --------------------------------------------------
+
+    def _on_rename_playlist_clicked(self, _button, pl: PlaylistRow) -> None:
+        entry = Gtk.Entry()
+        entry.set_text(pl.name)
+        dialog = Adw.AlertDialog(heading="Rename Playlist", body=f"New name for “{pl.name}”:")
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("rename", "Rename")
+        dialog.set_response_appearance("rename", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("rename")
+        dialog.connect("response", self._on_rename_playlist_response, pl, entry)
+        dialog.present(self)
+
+    def _on_rename_playlist_response(self, _dialog, response: str, pl: PlaylistRow, entry: Gtk.Entry) -> None:
+        if response != "rename":
+            return
+        new_name = entry.get_text().strip()
+        if not new_name or new_name == pl.name:
+            return
+        assert self.library is not None
+        try:
+            self.library.rename_playlist(pl.name, new_name)
+        except Exception as e:  # noqa: BLE001
+            self._show_error(f"Couldn't rename playlist: {e}")
+            return
+        if self._active_playlist is not None and self._active_playlist.name == pl.name:
+            self._active_playlist.name = new_name
+        self._reload_playlists_list()
+        self._reload_track_list()
+        self.toast(f"Renamed to “{new_name}”")
+
+    def _on_delete_playlist_clicked(self, _button, pl: PlaylistRow) -> None:
+        dialog = Adw.AlertDialog(
+            heading=f"Delete playlist “{pl.name}”?",
+            body="This only removes the playlist -- its tracks stay on the iPod.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.connect("response", self._on_delete_playlist_response, pl)
+        dialog.present(self)
+
+    def _on_delete_playlist_response(self, _dialog, response: str, pl: PlaylistRow) -> None:
+        if response != "delete":
+            return
+        assert self.library is not None
+        try:
+            self.library.delete_playlist(pl.name)
+        except Exception as e:  # noqa: BLE001
+            self._show_error(f"Couldn't delete playlist: {e}")
+            return
+        if self._active_playlist is not None and self._active_playlist.name == pl.name:
+            self._active_playlist = None
+            self._reload_track_list()
+        self._reload_playlists_list()
+        self.toast(f"Deleted “{pl.name}”")
+
+    def _on_remove_from_playlist_clicked(self, _button) -> None:
+        if self._active_playlist is None:
+            return
+        track_ids = self._selected_track_ids()
+        if not track_ids:
+            return
+        assert self.library is not None
+        self.library.remove_tracks_from_playlist(self._active_playlist.name, track_ids)
+        self._reload_track_list()
+        self._reload_playlists_list()
+        self.toast(f"Removed {len(track_ids)} track{'s' if len(track_ids) != 1 else ''} from playlist")
+
+    def _on_add_to_playlist_clicked(self, _button) -> None:
+        track_ids = self._selected_track_ids()
+        if not track_ids:
+            return
+        assert self.library is not None
+        names = [p.name for p in self.library.list_playlists()]
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        dropdown = Gtk.DropDown.new_from_strings(names) if names else None
+        if dropdown is not None:
+            box.append(dropdown)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("New playlist name…" if names else "Playlist name…")
+        box.append(entry)
+
+        dialog = Adw.AlertDialog(
+            heading=f"Add {len(track_ids)} Track{'s' if len(track_ids) != 1 else ''} to Playlist",
+            body="Choose an existing playlist above, or type a name to create a new one.",
+        )
+        dialog.set_extra_child(box)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("add", "Add")
+        dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("add")
+        dialog.connect("response", self._on_add_to_playlist_response, track_ids, names, dropdown, entry)
+        dialog.present(self)
+
+    def _on_add_to_playlist_response(self, _dialog, response: str, track_ids: list[int], names: list[str], dropdown, entry: Gtk.Entry) -> None:
+        if response != "add":
+            return
+        new_name = entry.get_text().strip()
+        if new_name:
+            name = new_name
+        elif dropdown is not None and dropdown.get_selected() != Gtk.INVALID_LIST_POSITION:
+            name = names[dropdown.get_selected()]
+        else:
+            self._show_error("Choose a playlist, or type a name for a new one.")
+            return
+        assert self.library is not None
+        self.library.add_tracks_to_playlist(name, track_ids)
+        self._reload_playlists_list()
+        if self._active_playlist is not None and self._active_playlist.name == name:
+            self._reload_track_list()
+        self.toast(f"Added to “{name}”")
 
     def _show_preferences(self) -> None:
         switch = Gtk.Switch()

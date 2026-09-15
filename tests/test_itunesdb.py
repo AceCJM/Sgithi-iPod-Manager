@@ -189,3 +189,44 @@ def test_set_artwork_link_roundtrips():
     assert raw2[0xA4] == 1
     assert struct.unpack_from("<H", raw2, 0x7C)[0] == 0
     assert struct.unpack_from("<I", raw2, 0x160)[0] == 0
+
+
+def test_rename_playlist_preserves_membership_and_roundtrips():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    t = db.add_track(idb.TrackMeta(track_id=0, dbid=0, title="A", ipod_location=idb.relpath_to_ipod_path("iPod_Control/Music/F00/A.m4a")))
+    pl = db.get_or_create_playlist("Old Name")
+    pl.add_track(t.track_id)
+    pl.set_title("New Name")
+
+    assert pl.title() == "New Name"
+    assert pl.mhip_track_ids == [t.track_id]
+
+    db2 = idb.ITunesDB.parse(db.serialize())
+    assert db2.find_playlist_by_name("Old Name") is None
+    found = db2.find_playlist_by_name("New Name")
+    assert found is not None
+    assert found.mhip_track_ids == [t.track_id]
+
+
+def test_delete_playlist_removes_it_but_not_its_tracks():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    t = db.add_track(idb.TrackMeta(track_id=0, dbid=0, title="A", ipod_location=idb.relpath_to_ipod_path("iPod_Control/Music/F00/A.m4a")))
+    pl = db.get_or_create_playlist("Temp")
+    pl.add_track(t.track_id)
+
+    assert db.delete_playlist(pl) is True
+    assert db.find_playlist_by_name("Temp") is None
+    # the track itself and its master-playlist membership are untouched
+    assert t.track_id in [tr.track_id for tr in db.tracks]
+    assert t.track_id in db.master_playlist().mhip_track_ids
+
+    db2 = idb.ITunesDB.parse(db.serialize())
+    assert db2.find_playlist_by_name("Temp") is None
+    assert len(db2.tracks) == 1
+
+
+def test_delete_playlist_refuses_master():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    master = db.master_playlist()
+    assert db.delete_playlist(master) is False
+    assert db.master_playlist() is master

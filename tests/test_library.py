@@ -294,3 +294,73 @@ def test_convert_to_aac_320_setting_off_by_default_keeps_lossless(fake_device, t
 
     codec = MP4(str(on_disk)).info.codec.lower()
     assert "alac" in codec
+
+
+def _add_bare_track(lib: Library, title: str) -> int:
+    """Add a track directly via the db layer (no ffmpeg/real audio file
+    needed) -- for tests that only care about playlist membership."""
+    meta = idb.TrackMeta(track_id=0, dbid=0, title=title, ipod_location=idb.relpath_to_ipod_path(f"iPod_Control/Music/F00/{title}.m4a"))
+    return lib.db.add_track(meta).track_id
+
+
+def test_rename_playlist(fake_device):
+    lib = Library(fake_device)
+    lib.load()
+    tid = _add_bare_track(lib, "Song")
+    lib.add_tracks_to_playlist("Old Name", [tid])
+
+    lib.rename_playlist("Old Name", "New Name")
+
+    names = {p.name for p in lib.list_playlists()}
+    assert names == {"New Name"}
+    assert lib.list_playlists()[0].track_ids == [tid]
+
+    lib2 = Library(fake_device)
+    lib2.load()
+    assert {p.name for p in lib2.list_playlists()} == {"New Name"}
+
+
+def test_rename_playlist_raises_if_missing(fake_device):
+    lib = Library(fake_device)
+    lib.load()
+    with pytest.raises(Exception):
+        lib.rename_playlist("Nope", "Whatever")
+
+
+def test_delete_playlist_leaves_tracks_intact(fake_device):
+    lib = Library(fake_device)
+    lib.load()
+    tid = _add_bare_track(lib, "Song")
+    lib.add_tracks_to_playlist("Temp", [tid])
+    assert len(lib.list_playlists()) == 1
+
+    lib.delete_playlist("Temp")
+    assert lib.list_playlists() == []
+    assert len(lib.list_tracks()) == 1  # the track itself wasn't touched
+
+    lib2 = Library(fake_device)
+    lib2.load()
+    assert lib2.list_playlists() == []
+    assert len(lib2.list_tracks()) == 1
+
+
+def test_add_and_remove_tracks_from_playlist(fake_device):
+    lib = Library(fake_device)
+    lib.load()
+    t1 = _add_bare_track(lib, "A")
+    t2 = _add_bare_track(lib, "B")
+
+    lib.add_tracks_to_playlist("Mix", [t1, t2])
+    playlist = lib.list_playlists()[0]
+    assert playlist.track_ids == [t1, t2]
+
+    # adding an already-present track again doesn't duplicate it
+    lib.add_tracks_to_playlist("Mix", [t1])
+    assert lib.list_playlists()[0].track_ids == [t1, t2]
+
+    lib.remove_tracks_from_playlist("Mix", [t1])
+    assert lib.list_playlists()[0].track_ids == [t2]
+
+    lib2 = Library(fake_device)
+    lib2.load()
+    assert lib2.list_playlists()[0].track_ids == [t2]
