@@ -322,6 +322,15 @@ _DISPLAY_FIELDS = {
 }
 
 
+# Byte offsets (within a track's mhit fixed header) that link it to an
+# ArtworkDB thumbnail entry -- see build_new_mhit for how these line up.
+# Convention (matching iTunes): has_artwork 1 = no artwork, 2 = has artwork;
+# 0 is "not yet checked" and only occurs on tracks synced by real iTunes.
+_HAS_ARTWORK_OFFSET = 0xA4  # uint8
+_ARTWORK_COUNT_OFFSET = 0x7C  # uint16 -- number of thumbnail sizes generated
+_MHII_LINK_OFFSET = 0x160  # uint32 -- ArtworkDB mhii's image_id, 0 = none
+
+
 @dataclass
 class RawTrack:
     """An existing track, kept mostly as an opaque blob.
@@ -334,6 +343,19 @@ class RawTrack:
     track_id: int
     raw: bytes
     display: dict = field(default_factory=dict)
+
+    def set_artwork_link(self, artwork_id: int, thumb_count: int = 0) -> None:
+        """Point this track's mhit header at an ArtworkDB entry (or clear
+        the link if artwork_id is 0). Safe to call on both freshly-built
+        and pre-existing (opaque-blob) tracks -- these three fields sit at
+        fixed offsets within the mhit header regardless of chunk length.
+        """
+        raw = bytearray(self.raw)
+        struct.pack_into("<B", raw, _HAS_ARTWORK_OFFSET, 2 if artwork_id else 1)
+        struct.pack_into("<H", raw, _ARTWORK_COUNT_OFFSET, thumb_count if artwork_id else 0)
+        struct.pack_into("<I", raw, _MHII_LINK_OFFSET, artwork_id)
+        self.raw = bytes(raw)
+        self.display["has_artwork"] = bool(artwork_id)
 
 
 def parse_mhit(buf: bytes, offset: int) -> RawTrack:
@@ -406,6 +428,15 @@ class RawPlaylist:
         self.mhip_track_ids.append(track_id)
         self.mhip_blobs.append(build_mhip(track_id))
 
+    def title(self) -> str:
+        pos = 0
+        while pos < len(self.body_before_mhips):
+            mtype, text, mlen = parse_mhod(self.body_before_mhips, pos)
+            if mtype == MhodType.TITLE and text is not None:
+                return text
+            pos += mlen
+        return ""
+
     def serialize(self) -> bytes:
         body = self.header_prefix + self.body_before_mhips + b"".join(self.mhip_blobs)
         total_len = len(body)
@@ -457,8 +488,8 @@ def parse_mhyp(buf: bytes, offset: int) -> RawPlaylist:
     )
 
 
-def build_new_master_playlist(name: str = "iPod") -> RawPlaylist:
-    """A fresh, empty master playlist -- title mhod only.
+def build_new_playlist(name: str, is_master: bool = False) -> RawPlaylist:
+    """A fresh, empty playlist -- title mhod only.
 
     Real iTunes also writes a second mhod (MHOD_ID_PLAYLIST, a ~0x288-byte
     blob of column-width/sort-order preferences for its own desktop UI) and,
@@ -470,7 +501,7 @@ def build_new_master_playlist(name: str = "iPod") -> RawPlaylist:
     header = bytearray()
     header += struct.pack("<4sIII", b"mhyp", 108, 0, 1)
     header += struct.pack("<I", 0)  # num_mhips, patched on serialize
-    header += struct.pack("<BBBB", 1, 0, 0, 0)  # type=master, flags
+    header += struct.pack("<BBBB", 1 if is_master else 0, 0, 0, 0)  # type, flags
     header += struct.pack("<I", unix_to_mac(None))  # timestamp
     header += struct.pack("<Q", 0)  # id
     header += struct.pack("<I", 0)
@@ -481,7 +512,13 @@ def build_new_master_playlist(name: str = "iPod") -> RawPlaylist:
     assert len(header) == 108
 
     body = pack_mhod_string(MhodType.TITLE, name)
-    return RawPlaylist(is_master=True, header_prefix=bytes(header), body_before_mhips=body, mhip_track_ids=[], mhip_blobs=[])
+    return RawPlaylist(
+        is_master=is_master, header_prefix=bytes(header), body_before_mhips=body, mhip_track_ids=[], mhip_blobs=[]
+    )
+
+
+def build_new_master_playlist(name: str = "iPod") -> RawPlaylist:
+    return build_new_playlist(name, is_master=True)
 
 
 # --------------------------------------------------------------------------
@@ -612,6 +649,26 @@ class ITunesDB:
                 s.playlists.insert(0, pl)
                 return pl
         pl = build_new_master_playlist()
+        self.sections.append(PlaylistsSection(playlists=[pl]))
+        return pl
+
+    def find_playlist_by_name(self, name: str) -> Optional[RawPlaylist]:
+        for pl in self.playlists:
+            if not pl.is_master and pl.title() == name:
+                return pl
+        return None
+
+    def get_or_create_playlist(self, name: str) -> RawPlaylist:
+        """Find a regular (non-master) playlist by title, or create a new
+        empty one with that title if none exists yet."""
+        existing = self.find_playlist_by_name(name)
+        if existing is not None:
+            return existing
+        pl = build_new_playlist(name, is_master=False)
+        for s in self.sections:
+            if isinstance(s, PlaylistsSection):
+                s.playlists.append(pl)
+                return pl
         self.sections.append(PlaylistsSection(playlists=[pl]))
         return pl
 

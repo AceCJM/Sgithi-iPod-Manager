@@ -19,10 +19,41 @@ to ALAC on import, since no iPod firmware can actually decode FLAC.
   recursively, with automatic FLAC → ALAC transcoding (via ffmpeg) so the
   device can actually play them — with a live progress bar (percentage,
   file count, current file/stage)
+- Import an `.m3u`/`.m3u8` playlist: every audio file it references gets
+  imported (if not already present) and a real on-device playlist is
+  created (or reused, if one with that name already exists) containing
+  them
+- Optional "convert to AAC 320" setting (Preferences): when on, anything
+  better than AAC 320kbps (lossless FLAC/ALAC, or lossy sources above
+  320kbps) is re-encoded down to AAC 320kbps on import instead of kept
+  losslessly, to save space; anything already at or below that quality is
+  always left unchanged. Off by default.
 - Delete tracks (removes the file and its database entry, and scrubs it
   from playlist membership so nothing points at a deleted track)
 - Every write to `iTunesDB` is preceded by a timestamped backup under
   `iPod_Control/iTunes/.ipodmanager_backups/`
+
+**Implemented but unverified against real hardware — classic iPod album
+art (iPod Video 5/5.5G):**
+
+- Song/album cover art embedded in an imported file's tags is written to
+  the device's `ArtworkDB` + `.ithmb` thumbnail files (100×100 and
+  200×200 RGB565, matching the iPod Video generation's on-device format),
+  so it should show up in the device's own now-playing/Cover
+  Flow UI — this is regenerated from scratch (re-scanning every track's
+  on-device file for embedded art) every time music is imported.
+- This one piece has **not** been confirmed against a real iPod — the
+  author doesn't own one. It was built the same way as the rest of the
+  classic-iPod code (transliterated from libgpod's actual C source, not
+  guessed), and every chunk length/nesting relationship is covered by
+  structural unit tests, but "does a real device actually render it" is
+  unverified. See "Classic iPod ArtworkDB: what's proven and what's not"
+  below before relying on it. Back up `iPod_Control` first.
+- "Playlist art" in this app's own Playlists view is a separate, much
+  lower-risk thing: just a thumbnail read from the first member track's
+  tags, shown only in this app's UI. Classic click-wheel firmware (even
+  the 5.5G's Cover Flow) has no native concept of a playlist thumbnail, so
+  there's nothing to write to the device for this part.
 
 **Partially working — iPhone 3G / iPod Touch-generation devices:**
 
@@ -44,15 +75,10 @@ to ALAC on import, since no iPod firmware can actually decode FLAC.
 
 **Not yet implemented:**
 
-- Writing album art onto the device (on-device Cover Flow/now-playing art).
-  The app shows artwork it finds in a file's tags everywhere in its own UI
-  (browsing, before upload), but doesn't write to the device's `ArtworkDB`
-  — that's a separate, poorly-documented, per-device raw-pixel binary
-  format with real corruption risk if gotten wrong. iPod 3G has no color
-  screen anyway; this only ever applies to Video 5/5.5G.
-- Playlist management (creating/editing playlists). New tracks are added
-  to the master playlist (so they show up under "Music"/"Songs"); any
-  existing custom playlists round-trip untouched.
+- Editing or deleting a playlist from within the app (only creating one via
+  M3U import, or having existing ones round-trip untouched).
+- iPod 3G artwork: it has no color screen, so `ArtworkDB` writing is only
+  ever attempted for the iPod Video 5/5.5G generation this app targets.
 - Any `mhsd` section this app doesn't understand (album/artist browse
   indices, Genius data, podcast/categorized playlist lists) is preserved
   byte-for-byte on write, not regenerated. If your library uses podcasts
@@ -67,6 +93,9 @@ sudo apt install gir1.2-gtk-4.0 gir1.2-adw-1 ffmpeg
 pip install -e .
 ```
 
+(`pip install -e .` pulls in Pillow, used to scale and pack cover art into
+the on-device `ArtworkDB` thumbnail format.)
+
 Run it:
 
 ```
@@ -74,9 +103,10 @@ python -m ipodmanager.ui.app
 ```
 
 Run the test suite (covers the binary format parser/writer with synthetic
-round-trip tests, the hash72 crypto, the SQLite mirror writer, and a full
-import→save→reload→delete→save→reload cycle — including batch/folder
-imports — against a fake device directory on disk):
+round-trip tests, the `ArtworkDB`/`.ithmb` chunk structure, the hash72
+crypto, the SQLite mirror writer, and a full import→save→reload→delete→
+save→reload cycle — including batch/folder/M3U-playlist imports and the
+AAC-320 quality setting — against a fake device directory on disk):
 
 ```
 pip install pytest
@@ -112,6 +142,14 @@ pip install pymobiledevice3
   (`src/db-itunes-parser.h`, `src/itdb_itunesdb.c`, GNU LGPL-2.1+) rather
   than reconstructed from memory. Also handles the zlib-compressed body
   variant of this same format used by iPhone-generation devices.
+- **`ipodmanager/db/artworkdb.py`** — writes the classic iPod's `ArtworkDB`
+  + `.ithmb` thumbnail files (cover art). Same "transliterated from
+  libgpod's actual C source, not reconstructed from memory" standard as
+  `itunesdb.py`, but unlike that module, **not yet confirmed against real
+  hardware** — see the "Classic iPod ArtworkDB" section below. Always
+  rebuilds from scratch (re-reading every track's on-device file's tags)
+  rather than incrementally merging with whatever's already there, which
+  keeps the write path simple at the cost of a bit of extra I/O per sync.
 - **`ipodmanager/db/hash72.py`** — the cryptographic signature
   iPhone/Touch/Nano-3G+-generation devices require over the classic
   format before they'll accept it. AES-128-CBC with a fixed key; ported
@@ -126,15 +164,83 @@ pip install pymobiledevice3
   devices" section for why this alone isn't enough to make new tracks
   show up in the Music app.
 - **`ipodmanager/audio/`** — `inspect.py` reads tags/artwork via `mutagen`;
-  `transcode.py` shells out to `ffmpeg` for FLAC → ALAC.
+  `transcode.py` shells out to `ffmpeg` for FLAC → ALAC and, when the
+  quality setting is on, anything → AAC 320.
 - **`ipodmanager/transport/`** — device detection. `classic.py` finds a
   mounted classic iPod via `Gio.VolumeMonitor`. `iphone.py` connects over
   USB via `pymobiledevice3`/AFC, no mount or jailbreak needed.
+- **`ipodmanager/settings.py`** — the one persisted app setting (convert-
+  to-AAC-320), a small JSON file under the user's config dir. Not
+  GSettings — that needs a compiled/installed schema, overkill for one
+  boolean.
 - **`ipodmanager/library.py`** — orchestrates device + database +
-  filesystem: importing (with transcode when needed, singly or as a
-  batch with progress reporting), deleting, backup, and safe writes
-  (write to a temp file, then atomic rename).
+  filesystem: importing (with transcode when needed, singly, as a batch,
+  or from an M3U playlist, all with progress reporting), rebuilding
+  `ArtworkDB`, deleting, backup, and safe writes (write to a temp file,
+  then atomic rename).
 - **`ipodmanager/ui/`** — the GTK4 + libadwaita interface.
+
+## Classic iPod ArtworkDB: what's proven and what's not
+
+Unlike the rest of the classic-iPod code (verified against real hardware),
+nobody working on this project owns a physical classic iPod, so this piece
+has only been checked for internal consistency, not for what a real device
+actually does with it. Documenting it the same way as the iPhone findings
+below, so a future attempt (with real hardware) knows exactly what's solid
+and what to check first.
+
+**Proven, from libgpod's actual source, not guesses:**
+
+- The full chunk hierarchy — `mhfd` (top-level header) → three `mhsd`
+  sections (image list / album list / file list, indices 1/2/3) → `mhli`
+  → one `mhii` per track-with-artwork (keyed by the track's own `dbid`,
+  the same id used in its `iTunesDB` `mhit` record) → one `mhod`
+  (type=LOCATION) per thumbnail size → `mhni` (format id, dimensions,
+  padding, byte offset/size within the `.ithmb` file) → one more `mhod`
+  (type=FILE_NAME) holding the `.ithmb` filename — was transliterated
+  field-by-field from `src/db-artwork-writer.c` and `src/db-itunes-parser.h`,
+  including every struct's exact "padded" on-disk size (e.g. `mhii` is
+  152 bytes even though only 52 are meaningful, the rest is zero
+  padding — `get_padded_header_size()` in that same file spells out every
+  chunk's real size). Covered by structural round-trip tests in
+  `tests/test_artworkdb.py`.
+- The iPod Video (5th/5.5th generation)'s cover-art thumbnail formats —
+  two sizes, 100×100 (format id 1028) and 200×200 (format id 1029), both
+  raw RGB565 little-endian pixel data — come from
+  `ipod_video_cover_art_info[]` in `src/itdb_device.c`.
+- The scaling/packing algorithm — fit-to-bounding-box (not crop-to-fill;
+  the iPod Video's format table doesn't set `crop`), centered on a black
+  canvas, bilinear resize — was transliterated from
+  `ithumb_writer_scale_and_crop()`/`pack_RGB_565()` in
+  `src/ithumb-writer.c`.
+- A track's `iTunesDB` `mhit` record links to its `ArtworkDB` entry via
+  three fields at fixed offsets in its fixed header (`has_artwork` at
+  0xA4, `artwork_count` at 0x7C, and the artwork id itself — `mhii_link`
+  — at 0x160), matching field order in `src/db-itunes-parser.h`'s
+  `_MhitHeader` struct.
+- The files live at `iPod_Control/Artwork/ArtworkDB` and
+  `iPod_Control/Artwork/F<format_id>_0.ithmb`, per
+  `itdb_get_artwork_dir()`/`get_ithmb_filename()` in the same source tree.
+
+**Not proven:**
+
+- Whether a real iPod Video actually renders thumbnails built this way.
+  Nothing here has been checked against a real device's firmware
+  behavior — only against what libgpod's own C code would produce, which
+  is itself a third-party reimplementation, not Apple's specification.
+- Whether `has_artwork`/`artwork_count`/`mhii_link`'s exact byte offsets
+  and value conventions (1 = no artwork, 2 = has artwork) are current for
+  every classic-iPod firmware revision, or specific to what libgpod's
+  authors observed.
+
+**If picking this back up:** test on a spare/non-critical classic iPod
+Video, back up `iPod_Control` first, import one track with embedded
+artwork, and check the device's own now-playing screen and Cover Flow. If
+artwork doesn't appear, re-check `db/artworkdb.py`'s chunk structure
+against `db-artwork-writer.c` byte-by-byte before assuming the algorithm
+itself is wrong — the format has a lot of interdependent small structs,
+and this document is a checklist of exactly what's already been verified
+against libgpod's source vs. what's still unconfirmed on real hardware.
 
 ## iPhone-generation devices: what's proven and what's not
 
@@ -239,12 +345,16 @@ firmware expects.
 
 ## A note on testing
 
-Classic iPod support has been verified with synthetic round-trip tests, a
+Classic iPod support (including M3U playlist import and the AAC-320
+quality setting) has been verified with synthetic round-trip tests, a
 simulated fake device directory on disk, and the app itself launched and
-visually confirmed to render correctly (empty state, populated track
-list, folder import with a live progress bar) — but **not yet against
-real classic-iPod hardware**. Test with a **spare/non-critical library
-first**; automatic backups live on the device itself
+exercised end-to-end (empty state, populated track list, folder/playlist
+import with a live progress bar, playlist browsing, preferences) — but
+**not yet against real classic-iPod hardware**. `ArtworkDB` writing is
+further behind: it's only been checked for internal structural
+consistency (see the dedicated section above), never against a real
+device at all. Test with a **spare/non-critical library first**;
+automatic backups live on the device itself
 (`iPod_Control/iTunes/.ipodmanager_backups/`) — copy one off the device
 if you want a copy that survives a "restore iPod" in iTunes.
 

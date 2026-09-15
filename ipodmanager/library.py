@@ -17,8 +17,10 @@ from typing import Callable, Optional
 
 from .audio import inspect as audio_inspect
 from .audio import transcode
+from .db import artworkdb
 from .db import hash72
 from .db import itunesdb as idb
+from .settings import Settings
 from .transport.base import Device
 
 FILETYPE_LABELS = {
@@ -30,6 +32,9 @@ FILETYPE_LABELS = {
 MUSIC_FOLDER_COUNT = 20
 
 SUPPORTED_AUDIO_EXTS = {".flac", ".m4a", ".mp4", ".m4b"}
+M3U_EXTS = {".m3u", ".m3u8"}
+
+AAC_320_BITRATE = 320
 
 
 def discover_audio_files(folder: Path) -> list[Path]:
@@ -40,10 +45,53 @@ def discover_audio_files(folder: Path) -> list[Path]:
     return sorted(found)
 
 
+def parse_m3u(path: Path) -> list[Path]:
+    """Read an .m3u/.m3u8 playlist and return the (resolved, but not
+    necessarily existing) paths it references, in order. Blank lines and
+    '#EXT...' directive/comment lines are skipped; relative entries are
+    resolved against the playlist file's own directory, matching how every
+    player that writes these treats them.
+    """
+    path = Path(path)
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    base = path.parent
+    entries: list[Path] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        entry = Path(line)
+        if not entry.is_absolute():
+            entry = base / entry
+        entries.append(entry)
+    return entries
+
+
 @dataclass
 class ImportResult:
     imported: list[TrackRow]
     errors: list[tuple[Path, str]]
+
+
+@dataclass
+class PlaylistRow:
+    """Flattened view of a device playlist, for display in the UI.
+
+    `artwork`/`artwork_mime` are only ever the embedded cover art of the
+    first member track that has any -- this app doesn't write a native
+    on-device "playlist thumbnail" (classic click-wheel firmware, even the
+    5.5G's Cover Flow, has no such concept), it's purely a convenience for
+    this app's own playlist list.
+    """
+
+    name: str
+    track_ids: list[int]
+    artwork: Optional[bytes] = None
+    artwork_mime: Optional[str] = None
+
+    @property
+    def track_count(self) -> int:
+        return len(self.track_ids)
 
 
 class LibraryError(RuntimeError):
@@ -103,17 +151,57 @@ def _random_ipod_filename(ext: str) -> str:
 
 
 class Library:
-    def __init__(self, device: Device):
+    def __init__(self, device: Device, settings: Optional[Settings] = None):
         self.device = device
+        self.settings = settings if settings is not None else Settings.load()
         self.db: Optional[idb.ITunesDB] = None
 
     def load(self) -> None:
         data = self.device.itunesdb_path.read_bytes()
         self.db = idb.ITunesDB.parse(data)
 
-    def list_tracks(self) -> list[TrackRow]:
+    def list_tracks(self, track_ids: Optional[list[int]] = None) -> list[TrackRow]:
+        """All tracks, or (if track_ids is given) just those, in that order
+        -- used to show a single playlist's contents."""
         assert self.db is not None
-        return [TrackRow.from_raw(t) for t in self.db.tracks]
+        tracks = self.db.tracks
+        if track_ids is not None:
+            order = {tid: i for i, tid in enumerate(track_ids)}
+            tracks = sorted((t for t in tracks if t.track_id in order), key=lambda t: order[t.track_id])
+        return [TrackRow.from_raw(t) for t in tracks]
+
+    def list_playlists(self) -> list[PlaylistRow]:
+        """Every regular (non-master) playlist, with a best-effort cover
+        thumbnail read from the first member track's embedded tag art."""
+        assert self.db is not None
+        rows = []
+        for pl in self.db.playlists:
+            if pl.is_master:
+                continue
+            artwork = None
+            artwork_mime = None
+            for tid in pl.mhip_track_ids:
+                track = next((t for t in self.db.tracks if t.track_id == tid), None)
+                if track is None:
+                    continue
+                info = self._inspect_device_track(track)
+                if info is not None and info.artwork:
+                    artwork, artwork_mime = info.artwork, info.artwork_mime
+                    break
+            rows.append(PlaylistRow(name=pl.title() or "(untitled)", track_ids=list(pl.mhip_track_ids), artwork=artwork, artwork_mime=artwork_mime))
+        return rows
+
+    def _inspect_device_track(self, track: idb.RawTrack) -> Optional[audio_inspect.AudioInfo]:
+        rel = idb.ipod_path_to_relpath(track.display.get("ipod_location", ""))
+        if not rel:
+            return None
+        path = self.device.mount_root / rel
+        if not path.is_file():
+            return None
+        try:
+            return audio_inspect.inspect(path)
+        except Exception:  # noqa: BLE001 - a corrupt/unreadable file just has no art
+            return None
 
     def backup(self) -> Path:
         ts = time.strftime("%Y%m%d-%H%M%S")
@@ -153,6 +241,20 @@ class Library:
             ) from e
         return hash72.sign(data, secret)
 
+    def _quality_transcode_target(self, info: audio_inspect.AudioInfo) -> Optional[str]:
+        """If the "convert to AAC 320" setting is on and this source is
+        better than that (lossless, or lossy above 320kbps), returns "aac"
+        to shrink it. Otherwise None -- leave format/quality as-is (still
+        subject to the separate FLAC-can't-play-natively transcode below).
+        """
+        if not self.settings.convert_to_aac_320:
+            return None
+        if info.format in ("flac", "alac"):
+            return "aac"
+        if info.bitrate and info.bitrate > AAC_320_BITRATE:
+            return "aac"
+        return None
+
     def import_file(self, src_path: Path, on_progress: Optional[Callable[[str], None]] = None) -> TrackRow:
         assert self.db is not None
         src_path = Path(src_path)
@@ -163,15 +265,36 @@ class Library:
 
         report(f"Reading {src_path.name}")
         info = audio_inspect.inspect(src_path)
+        shrink_to_aac = self._quality_transcode_target(info) == "aac"
 
         work_path = src_path
         tmpdir = None
-        if info.format == "flac":
+        if info.format == "flac" and shrink_to_aac:
+            report(f"Transcoding {src_path.name} (FLAC → AAC 320, quality setting enabled)")
+            tmpdir = tempfile.mkdtemp(prefix="ipodmanager-")
+            work_path = Path(tmpdir) / (src_path.stem + ".m4a")
+            try:
+                transcode.to_aac(src_path, work_path, AAC_320_BITRATE)
+                info = audio_inspect.inspect(work_path)
+            except Exception:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                raise
+        elif info.format == "flac":
             report(f"Transcoding {src_path.name} (FLAC → ALAC, iPod can't play FLAC)")
             tmpdir = tempfile.mkdtemp(prefix="ipodmanager-")
             work_path = Path(tmpdir) / (src_path.stem + ".m4a")
             try:
                 transcode.flac_to_alac(src_path, work_path)
+                info = audio_inspect.inspect(work_path)
+            except Exception:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                raise
+        elif shrink_to_aac:
+            report(f"Transcoding {src_path.name} ({info.format.upper()} → AAC 320, quality setting enabled)")
+            tmpdir = tempfile.mkdtemp(prefix="ipodmanager-")
+            work_path = Path(tmpdir) / (src_path.stem + ".m4a")
+            try:
+                transcode.to_aac(src_path, work_path, AAC_320_BITRATE)
                 info = audio_inspect.inspect(work_path)
             except Exception:
                 shutil.rmtree(tmpdir, ignore_errors=True)
@@ -254,11 +377,98 @@ class Library:
                 on_progress(i + 1, total, path.name)
 
         if save and imported:
+            if self.device.kind == "classic_ipod":
+                self.rebuild_artwork_db(on_progress=on_progress)
             if on_progress:
                 on_progress(total, total, "Saving library…")
             self.save()
 
         return ImportResult(imported=imported, errors=errors)
+
+    def import_playlist(
+        self,
+        m3u_path: Path,
+        playlist_name: Optional[str] = None,
+        on_progress: Optional[Callable[[int, int, str], None]] = None,
+    ) -> ImportResult:
+        """Parse an .m3u/.m3u8, import every audio file it references (there's
+        no reliable way to detect "already on the device" once a file's
+        original path is gone, so this always imports each referenced file,
+        same as "Add Files…" would for the same paths), and add the results
+        to a playlist with this name -- creating it if needed, or reusing it
+        if a playlist with that name already exists.
+        """
+        assert self.db is not None
+        m3u_path = Path(m3u_path)
+        entries = parse_m3u(m3u_path)
+
+        paths: list[Path] = []
+        errors: list[tuple[Path, str]] = []
+        for entry in entries:
+            if not entry.is_file():
+                errors.append((entry, "referenced file not found"))
+            elif entry.suffix.lower() not in SUPPORTED_AUDIO_EXTS:
+                errors.append((entry, f"unsupported file type: {entry.suffix}"))
+            else:
+                paths.append(entry)
+
+        result = self.import_paths(paths, on_progress=on_progress, save=False)
+        result.errors = errors + result.errors
+
+        name = playlist_name or m3u_path.stem
+        playlist = self.db.get_or_create_playlist(name)
+        existing_ids = set(playlist.mhip_track_ids)
+        for row in result.imported:
+            if row.track_id not in existing_ids:
+                playlist.add_track(row.track_id)
+                existing_ids.add(row.track_id)
+
+        if result.imported:
+            if self.device.kind == "classic_ipod":
+                self.rebuild_artwork_db(on_progress=on_progress)
+            self.save()
+
+        return result
+
+    def rebuild_artwork_db(self, on_progress: Optional[Callable[[int, int, str], None]] = None) -> None:
+        """Regenerate ArtworkDB + its .ithmb thumbnail files from scratch,
+        based on whatever embedded cover art is currently in each track's
+        on-device file, and re-point every track's mhit header at its new
+        artwork entry (or clear the link if it has none).
+
+        Always a full rebuild rather than an incremental merge -- see
+        db/artworkdb.py's module docstring for why. This means it re-reads
+        every track's tags on every call, which is the main cost of
+        importing music with this feature on.
+        """
+        assert self.db is not None
+        if self.device.kind != "classic_ipod":
+            return
+
+        tracks = self.db.tracks
+        total = len(tracks)
+        tracks_with_art: list[tuple[int, int, bytes]] = []
+        for i, t in enumerate(tracks):
+            if on_progress:
+                on_progress(total, total, f"Scanning artwork ({i + 1}/{total})")
+            info = self._inspect_device_track(t)
+            if info is not None and info.artwork:
+                tracks_with_art.append((t.track_id, t.display.get("dbid", 0), info.artwork))
+
+        if on_progress:
+            on_progress(total, total, "Building ArtworkDB…")
+        result = artworkdb.build_artwork_db(tracks_with_art)
+
+        thumb_count = len(artworkdb.COVER_ART_FORMATS)
+        for t in tracks:
+            artwork_id = result.artwork_ids_by_track.get(t.track_id, 0)
+            t.set_artwork_link(artwork_id, thumb_count if artwork_id else 0)
+
+        artwork_dir = self.device.artwork_dir()
+        artwork_dir.mkdir(parents=True, exist_ok=True)
+        (artwork_dir / "ArtworkDB").write_bytes(result.artworkdb_bytes)
+        for name, data in result.ithmb_files.items():
+            (artwork_dir / name).write_bytes(data)
 
     def delete_track(self, track_id: int) -> None:
         assert self.db is not None

@@ -4,13 +4,16 @@ verify it shows up and the file lands on "disk", save/reload, then delete
 it and verify the file is gone and the reference is scrubbed.
 """
 
+import io
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from ipodmanager.library import Library, discover_audio_files
+from ipodmanager.db import itunesdb as idb
+from ipodmanager.library import Library, discover_audio_files, parse_m3u
+from ipodmanager.settings import Settings
 from ipodmanager.transport.base import Device
 
 from .helpers import build_empty_mhbd
@@ -148,3 +151,146 @@ def test_import_paths_continues_after_one_bad_file(fake_device, tmp_path):
     assert result.imported == []
     assert len(result.errors) == 1
     assert result.errors[0][0] == bad
+
+
+def _make_flac(path: Path, freq: int, title: str, with_art: bool = False) -> Path:
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency={freq}:duration=1", "-ar", "44100", str(path)],
+        check=True, capture_output=True,
+    )
+    from mutagen.flac import FLAC, Picture
+
+    f = FLAC(str(path))
+    f["title"] = title
+    if with_art:
+        from PIL import Image
+
+        img = Image.new("RGB", (50, 50), (10, 200, 10))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        pic = Picture()
+        pic.type = 3
+        pic.mime = "image/png"
+        pic.data = buf.getvalue()
+        f.add_picture(pic)
+    f.save()
+    return path
+
+
+def test_parse_m3u_resolves_relative_entries_and_skips_comments(tmp_path):
+    (tmp_path / "songs").mkdir()
+    m3u = tmp_path / "playlist.m3u"
+    m3u.write_text("#EXTM3U\n#EXTINF:123,Some Song\nsongs/one.flac\n\n/abs/two.flac\n")
+    entries = parse_m3u(m3u)
+    assert entries == [tmp_path / "songs" / "one.flac", Path("/abs/two.flac")]
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not installed")
+def test_import_playlist_creates_playlist_with_members(fake_device, tmp_path):
+    a = _make_flac(tmp_path / "a.flac", 300, "Song A")
+    b = _make_flac(tmp_path / "b.flac", 400, "Song B")
+    m3u = tmp_path / "Road Trip.m3u"
+    m3u.write_text("a.flac\nb.flac\n")
+
+    lib = Library(fake_device)
+    lib.load()
+    result = lib.import_playlist(m3u)
+    assert len(result.imported) == 2
+    assert result.errors == []
+
+    playlists = lib.list_playlists()
+    assert len(playlists) == 1
+    assert playlists[0].name == "Road Trip"
+    assert playlists[0].track_count == 2
+
+    filtered = lib.list_tracks(track_ids=playlists[0].track_ids)
+    assert [t.title for t in filtered] == ["Song A", "Song B"]
+
+    # reload from disk -- playlist membership must have been persisted
+    lib2 = Library(fake_device)
+    lib2.load()
+    playlists2 = lib2.list_playlists()
+    assert len(playlists2) == 1
+    assert playlists2[0].track_count == 2
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not installed")
+def test_import_playlist_reports_missing_file(fake_device, tmp_path):
+    a = _make_flac(tmp_path / "a.flac", 300, "Song A")
+    m3u = tmp_path / "list.m3u"
+    m3u.write_text("a.flac\nmissing.flac\n")
+
+    lib = Library(fake_device)
+    lib.load()
+    result = lib.import_playlist(m3u)
+    assert len(result.imported) == 1
+    assert len(result.errors) == 1
+    assert result.errors[0][0] == tmp_path / "missing.flac"
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not installed")
+def test_import_playlist_reusing_same_name_does_not_duplicate_playlist(fake_device, tmp_path):
+    a = _make_flac(tmp_path / "a.flac", 300, "Song A")
+    b = _make_flac(tmp_path / "b.flac", 400, "Song B")
+    m3u1 = tmp_path / "list.m3u"
+    m3u1.write_text("a.flac\n")
+    m3u2 = tmp_path / "list2.m3u"
+    m3u2.write_text("b.flac\n")
+
+    lib = Library(fake_device)
+    lib.load()
+    lib.import_playlist(m3u1, playlist_name="Mix")
+    lib.import_playlist(m3u2, playlist_name="Mix")
+
+    playlists = lib.list_playlists()
+    assert len(playlists) == 1
+    assert playlists[0].track_count == 2
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not installed")
+def test_rebuild_artwork_db_writes_files_and_links_track(fake_device, tmp_path):
+    song = _make_flac(tmp_path / "art.flac", 300, "Arty Song", with_art=True)
+
+    lib = Library(fake_device)
+    lib.load()
+    row = lib.import_file(song)
+    lib.rebuild_artwork_db()
+    lib.save()
+
+    artwork_dir = fake_device.mount_root / "iPod_Control" / "Artwork"
+    assert (artwork_dir / "ArtworkDB").is_file()
+    assert (artwork_dir / "F1028_0.ithmb").stat().st_size > 0
+    assert (artwork_dir / "F1029_0.ithmb").stat().st_size > 0
+
+    track = next(t for t in lib.db.tracks if t.track_id == row.track_id)
+    assert track.raw[0xA4] == 2  # has_artwork
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not installed")
+def test_convert_to_aac_320_setting_shrinks_flac_instead_of_alac(fake_device, tmp_path):
+    song = _make_flac(tmp_path / "lossless.flac", 300, "Lossless Song")
+
+    lib = Library(fake_device, settings=Settings(convert_to_aac_320=True))
+    lib.load()
+    row = lib.import_file(song)
+
+    on_disk = fake_device.mount_root / row.ipod_location.lstrip(":").replace(":", "/")
+    from mutagen.mp4 import MP4
+
+    codec = MP4(str(on_disk)).info.codec.lower()
+    assert "alac" not in codec  # shrunk to lossy AAC, not preserved as lossless ALAC
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not installed")
+def test_convert_to_aac_320_setting_off_by_default_keeps_lossless(fake_device, tmp_path):
+    song = _make_flac(tmp_path / "lossless2.flac", 300, "Lossless Song 2")
+
+    lib = Library(fake_device)  # default settings: convert_to_aac_320 = False
+    lib.load()
+    row = lib.import_file(song)
+
+    on_disk = fake_device.mount_root / row.ipod_location.lstrip(":").replace(":", "/")
+    from mutagen.mp4 import MP4
+
+    codec = MP4(str(on_disk)).info.codec.lower()
+    assert "alac" in codec

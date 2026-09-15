@@ -132,3 +132,60 @@ def test_compressed_db_parses_and_roundtrips():
     db2 = idb.ITunesDB.parse(reserialized)
     assert len(db2.tracks) == 1
     assert db2.tracks[0].display["title"] == "Compressed Track"
+
+
+def test_get_or_create_playlist_creates_named_non_master_playlist():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    pl = db.get_or_create_playlist("Road Trip")
+    assert pl.is_master is False
+    assert pl.title() == "Road Trip"
+    assert [p for p in db.playlists if not p.is_master] == [pl]
+
+    # calling again with the same name reuses it rather than duplicating
+    again = db.get_or_create_playlist("Road Trip")
+    assert again is pl
+    assert len([p for p in db.playlists if not p.is_master]) == 1
+
+    other = db.get_or_create_playlist("Chill")
+    assert other is not pl
+    assert len([p for p in db.playlists if not p.is_master]) == 2
+
+
+def test_named_playlist_roundtrips_with_members():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    t1 = db.add_track(idb.TrackMeta(track_id=0, dbid=0, title="A", ipod_location=idb.relpath_to_ipod_path("iPod_Control/Music/F00/A.m4a")))
+    t2 = db.add_track(idb.TrackMeta(track_id=0, dbid=0, title="B", ipod_location=idb.relpath_to_ipod_path("iPod_Control/Music/F00/B.m4a")))
+
+    pl = db.get_or_create_playlist("Faves")
+    pl.add_track(t1.track_id)
+    pl.add_track(t2.track_id)
+
+    db2 = idb.ITunesDB.parse(db.serialize())
+    found = db2.find_playlist_by_name("Faves")
+    assert found is not None
+    assert found.mhip_track_ids == [t1.track_id, t2.track_id]
+    # the master playlist is untouched and still separately findable
+    assert db2.master_playlist().is_master is True
+    assert db2.find_playlist_by_name("iPod") is None  # master isn't a "named" playlist match
+
+
+def test_set_artwork_link_roundtrips():
+    db = idb.ITunesDB.parse(build_empty_mhbd())
+    t = db.add_track(idb.TrackMeta(track_id=0, dbid=0, title="Art", ipod_location=idb.relpath_to_ipod_path("iPod_Control/Music/F00/X.m4a")))
+    t.set_artwork_link(100, thumb_count=2)
+
+    db2 = idb.ITunesDB.parse(db.serialize())
+    raw = db2.tracks[0].raw
+    has_artwork = raw[0xA4]
+    artwork_count = struct.unpack_from("<H", raw, 0x7C)[0]
+    mhii_link = struct.unpack_from("<I", raw, 0x160)[0]
+    assert has_artwork == 2
+    assert artwork_count == 2
+    assert mhii_link == 100
+
+    # clearing it back to "no artwork" works too
+    db2.tracks[0].set_artwork_link(0)
+    raw2 = db2.tracks[0].raw
+    assert raw2[0xA4] == 1
+    assert struct.unpack_from("<H", raw2, 0x7C)[0] == 0
+    assert struct.unpack_from("<I", raw2, 0x160)[0] == 0

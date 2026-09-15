@@ -8,14 +8,17 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gio", "2.0")
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "4.0")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from ..library import Library, discover_audio_files
+from ..library import Library, PlaylistRow, discover_audio_files
+from ..settings import Settings
 from ..transport import classic, iphone
 from ..transport.base import Device
 from .track_object import TrackObject
 
 SUPPORTED_EXTENSIONS = [".flac", ".m4a", ".mp4", ".m4b"]
+M3U_EXTENSIONS = [".m3u", ".m3u8"]
 
 
 class IPodWindow(Adw.ApplicationWindow):
@@ -27,6 +30,8 @@ class IPodWindow(Adw.ApplicationWindow):
         self.device: Device | None = None
         self.library: Library | None = None
         self._mounted_iphone: iphone.MountedIPhone | None = None
+        self.settings = Settings.load()
+        self._active_playlist: PlaylistRow | None = None
         self.store = Gio.ListStore(item_type=TrackObject)
 
         self.toast_overlay = Adw.ToastOverlay()
@@ -47,8 +52,11 @@ class IPodWindow(Adw.ApplicationWindow):
         add_files_row.connect("clicked", self._on_add_files_row_clicked, add_popover)
         add_folder_row = Gtk.Button(label="Add Folder…", has_frame=False)
         add_folder_row.connect("clicked", self._on_add_folder_row_clicked, add_popover)
+        add_playlist_row = Gtk.Button(label="Import Playlist (M3U)…", has_frame=False)
+        add_playlist_row.connect("clicked", self._on_add_playlist_row_clicked, add_popover)
         add_box.append(add_files_row)
         add_box.append(add_folder_row)
+        add_box.append(add_playlist_row)
         add_popover.set_child(add_box)
         self.add_button.set_popover(add_popover)
         header.pack_start(self.add_button)
@@ -59,10 +67,20 @@ class IPodWindow(Adw.ApplicationWindow):
         self.delete_button.set_sensitive(False)
         header.pack_start(self.delete_button)
 
+        self.playlists_toggle = Gtk.ToggleButton(label="Playlists")
+        self.playlists_toggle.set_sensitive(False)
+        self.playlists_toggle.connect("toggled", self._on_playlists_toggled)
+        header.pack_start(self.playlists_toggle)
+
         refresh_button = Gtk.Button(icon_name="view-refresh-symbolic")
         refresh_button.set_tooltip_text("Look for a connected iPod")
         refresh_button.connect("clicked", lambda *_: self.refresh_device())
         header.pack_end(refresh_button)
+
+        prefs_button = Gtk.Button(icon_name="preferences-system-symbolic")
+        prefs_button.set_tooltip_text("Preferences")
+        prefs_button.connect("clicked", lambda *_: self._show_preferences())
+        header.pack_end(prefs_button)
 
         self.status_label = Gtk.Label(label="No iPod detected")
         self.status_label.add_css_class("dim-label")
@@ -97,7 +115,38 @@ class IPodWindow(Adw.ApplicationWindow):
 
         scroller = Gtk.ScrolledWindow()
         scroller.set_child(self.column_view)
-        self.stack.add_named(scroller, "tracks")
+        scroller.set_vexpand(True)
+
+        self.playlist_filter_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.playlist_filter_bar.set_margin_top(6)
+        self.playlist_filter_bar.set_margin_bottom(6)
+        self.playlist_filter_bar.set_margin_start(12)
+        self.playlist_filter_bar.set_margin_end(12)
+        self.playlist_filter_label = Gtk.Label(xalign=0)
+        self.playlist_filter_label.add_css_class("title-4")
+        self.playlist_filter_label.set_hexpand(True)
+        show_all_button = Gtk.Button(label="Show All Tracks")
+        show_all_button.connect("clicked", self._on_show_all_tracks_clicked)
+        self.playlist_filter_bar.append(self.playlist_filter_label)
+        self.playlist_filter_bar.append(show_all_button)
+        self.playlist_filter_bar.set_visible(False)
+
+        tracks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        tracks_box.append(self.playlist_filter_bar)
+        tracks_box.append(scroller)
+        self.stack.add_named(tracks_box, "tracks")
+
+        self.playlists_listbox = Gtk.ListBox()
+        self.playlists_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.playlists_listbox.add_css_class("boxed-list")
+        self.playlists_listbox.set_margin_top(12)
+        self.playlists_listbox.set_margin_bottom(12)
+        self.playlists_listbox.set_margin_start(12)
+        self.playlists_listbox.set_margin_end(12)
+        self.playlists_listbox.connect("row-activated", self._on_playlist_row_activated)
+        playlists_scroller = Gtk.ScrolledWindow()
+        playlists_scroller.set_child(self.playlists_listbox)
+        self.stack.add_named(playlists_scroller, "playlists")
 
         self.stack.set_visible_child_name("empty")
 
@@ -181,16 +230,18 @@ class IPodWindow(Adw.ApplicationWindow):
         if not devices:
             self.device = None
             self.library = None
+            self._active_playlist = None
             self.store.remove_all()
             self.status_label.set_text("No iPod detected")
             self.add_button.set_sensitive(False)
+            self.playlists_toggle.set_sensitive(False)
             self.stack.set_visible_child_name("empty")
             return
 
         self.device = devices[0]
         self.status_label.set_text(self.device.display_name)
         try:
-            self.library = Library(self.device)
+            self.library = Library(self.device, settings=self.settings)
             self.library.load()
         except Exception as e:  # noqa: BLE001 - surface any parse failure to the user
             self.library = None
@@ -199,6 +250,8 @@ class IPodWindow(Adw.ApplicationWindow):
             return
 
         self.add_button.set_sensitive(True)
+        self.playlists_toggle.set_sensitive(True)
+        self._active_playlist = None
         self._reload_track_list()
         self.stack.set_visible_child_name("tracks")
 
@@ -210,12 +263,112 @@ class IPodWindow(Adw.ApplicationWindow):
     def _reload_track_list(self) -> None:
         self.store.remove_all()
         assert self.library is not None
-        for row in self.library.list_tracks():
+        if self._active_playlist is not None:
+            # re-fetch in case membership changed since it was selected
+            self._active_playlist = next(
+                (p for p in self.library.list_playlists() if p.name == self._active_playlist.name), None
+            )
+        track_ids = self._active_playlist.track_ids if self._active_playlist else None
+        for row in self.library.list_tracks(track_ids=track_ids):
             self.store.append(TrackObject(row))
+        if self._active_playlist is not None:
+            self.playlist_filter_label.set_text(f"Playlist: {self._active_playlist.name}")
+            self.playlist_filter_bar.set_visible(True)
+        else:
+            self.playlist_filter_bar.set_visible(False)
+
+    def _reload_playlists_list(self) -> None:
+        row = self.playlists_listbox.get_row_at_index(0)
+        while row is not None:
+            self.playlists_listbox.remove(row)
+            row = self.playlists_listbox.get_row_at_index(0)
+        assert self.library is not None
+        for pl in self.library.list_playlists():
+            self.playlists_listbox.append(self._build_playlist_row(pl))
+
+    def _build_playlist_row(self, pl: PlaylistRow) -> Gtk.ListBoxRow:
+        row = Gtk.ListBoxRow()
+        row.playlist = pl
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.append(self._make_playlist_thumbnail(pl))
+        labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        labels.set_valign(Gtk.Align.CENTER)
+        title_label = Gtk.Label(label=pl.name, xalign=0)
+        count_label = Gtk.Label(label=f"{pl.track_count} track{'s' if pl.track_count != 1 else ''}", xalign=0)
+        count_label.add_css_class("dim-label")
+        labels.append(title_label)
+        labels.append(count_label)
+        box.append(labels)
+        row.set_child(box)
+        return row
+
+    def _make_playlist_thumbnail(self, pl: PlaylistRow) -> Gtk.Widget:
+        size = 48
+        if pl.artwork:
+            try:
+                texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(pl.artwork))
+                picture = Gtk.Picture.new_for_paintable(texture)
+                picture.set_content_fit(Gtk.ContentFit.COVER)
+                picture.set_size_request(size, size)
+                return picture
+            except GLib.Error:
+                pass
+        icon = Gtk.Image.new_from_icon_name("emblem-music-symbolic")
+        icon.set_pixel_size(size)
+        icon.set_size_request(size, size)
+        return icon
+
+    def _on_playlists_toggled(self, button: Gtk.ToggleButton) -> None:
+        if button.get_active():
+            self._reload_playlists_list()
+            self.stack.set_visible_child_name("playlists")
+        elif self.library is not None:
+            self.stack.set_visible_child_name("tracks")
+
+    def _on_playlist_row_activated(self, _listbox, row: Gtk.ListBoxRow) -> None:
+        self._active_playlist = row.playlist
+        self._reload_track_list()
+        self.playlists_toggle.set_active(False)
+        self.stack.set_visible_child_name("tracks")
+
+    def _on_show_all_tracks_clicked(self, _button) -> None:
+        self._active_playlist = None
+        self._reload_track_list()
 
     def on_selection_changed(self, *_args) -> None:
         bitset = self.selection_model.get_selection()
         self.delete_button.set_sensitive(bitset.get_size() > 0)
+
+    def _show_preferences(self) -> None:
+        switch = Gtk.Switch()
+        switch.set_active(self.settings.convert_to_aac_320)
+        switch.set_valign(Gtk.Align.CENTER)
+        label = Gtk.Label(label="Convert higher-quality imports to AAC 320", xalign=0)
+        label.set_wrap(True)
+        label.set_hexpand(True)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row.append(label)
+        row.append(switch)
+
+        dialog = Adw.AlertDialog(
+            heading="Preferences",
+            body="When enabled, lossless (FLAC/ALAC) imports and lossy files above 320kbps are "
+            "re-encoded down to AAC 320kbps on import to save space. Files already at or below "
+            "that quality are always left unchanged.",
+        )
+        dialog.set_extra_child(row)
+        dialog.add_response("close", "Close")
+        dialog.set_default_response("close")
+        dialog.connect("response", lambda *_: self._save_preferences(switch.get_active()))
+        dialog.present(self)
+
+    def _save_preferences(self, convert_to_aac_320: bool) -> None:
+        self.settings.convert_to_aac_320 = convert_to_aac_320
+        self.settings.save()
 
     def _show_error(self, message: str) -> None:
         dialog = Adw.AlertDialog(heading="Error", body=message)
@@ -240,6 +393,70 @@ class IPodWindow(Adw.ApplicationWindow):
         popover.popdown()
         dialog = Gtk.FileDialog()
         dialog.select_folder(self, None, self._on_folder_chosen)
+
+    def _on_add_playlist_row_clicked(self, _button, popover: Gtk.Popover) -> None:
+        popover.popdown()
+        dialog = Gtk.FileDialog()
+        filt = Gtk.FileFilter()
+        filt.set_name("M3U playlists")
+        for ext in M3U_EXTENSIONS:
+            filt.add_pattern(f"*{ext}")
+        filters = Gio.ListStore(item_type=Gtk.FileFilter)
+        filters.append(filt)
+        dialog.set_filters(filters)
+        dialog.open(self, None, self._on_m3u_chosen)
+
+    def _on_m3u_chosen(self, dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
+        try:
+            file = dialog.open_finish(result)
+        except GLib.Error:
+            return
+        path = file.get_path() if file else None
+        if not path:
+            return
+        m3u_path = Path(path)
+
+        entry = Gtk.Entry()
+        entry.set_text(m3u_path.stem)
+        name_dialog = Adw.AlertDialog(
+            heading="Playlist Name", body="Name for the new (or existing) playlist on the iPod:"
+        )
+        name_dialog.set_extra_child(entry)
+        name_dialog.add_response("cancel", "Cancel")
+        name_dialog.add_response("import", "Import")
+        name_dialog.set_response_appearance("import", Adw.ResponseAppearance.SUGGESTED)
+        name_dialog.set_default_response("import")
+        name_dialog.connect("response", self._on_playlist_name_response, m3u_path, entry)
+        name_dialog.present(self)
+
+    def _on_playlist_name_response(self, _dialog, response: str, m3u_path: Path, entry: Gtk.Entry) -> None:
+        if response != "import":
+            return
+        name = entry.get_text().strip() or m3u_path.stem
+        self._import_m3u(m3u_path, name)
+
+    def _import_m3u(self, m3u_path: Path, playlist_name: str) -> None:
+        assert self.library is not None
+        library = self.library  # snapshot: don't chase self.library if it changes mid-import
+        self.stack.set_visible_child_name("progress")
+        self.add_button.set_sensitive(False)
+        self.playlists_toggle.set_sensitive(False)
+        self.progress_title.set_text(f"Importing playlist “{playlist_name}”…")
+        self._set_progress(0, 1, "")
+
+        def on_progress(completed: int, total: int, detail: str) -> None:
+            GLib.idle_add(self._set_progress, completed, total, detail)
+
+        def worker() -> None:
+            try:
+                result = library.import_playlist(m3u_path, playlist_name=playlist_name, on_progress=on_progress)
+            except Exception as e:  # noqa: BLE001 - e.g. save() failing after all files imported
+                GLib.idle_add(self._import_finished, 0, [f"Importing the playlist failed: {e}"])
+                return
+            errors = [f"{p.name}: {msg}" for p, msg in result.errors]
+            GLib.idle_add(self._import_finished, len(result.imported), errors)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_files_chosen(self, dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
         try:
@@ -269,6 +486,7 @@ class IPodWindow(Adw.ApplicationWindow):
         library = self.library  # snapshot: don't chase self.library if it changes mid-import
         self.stack.set_visible_child_name("progress")
         self.add_button.set_sensitive(False)
+        self.playlists_toggle.set_sensitive(False)
         self.progress_title.set_text(f"Importing {len(paths)} file{'s' if len(paths) != 1 else ''}…")
         self._set_progress(0, len(paths), "")
 
@@ -288,7 +506,9 @@ class IPodWindow(Adw.ApplicationWindow):
 
     def _import_finished(self, imported: int, errors: list[str]) -> bool:
         self.add_button.set_sensitive(True)
+        self.playlists_toggle.set_sensitive(True)
         self._reload_track_list()
+        self._reload_playlists_list()
         self.stack.set_visible_child_name("tracks")
         if imported:
             self.toast(f"Added {imported} track{'s' if imported != 1 else ''}")
@@ -332,4 +552,5 @@ class IPodWindow(Adw.ApplicationWindow):
         except Exception as e:  # noqa: BLE001
             self._show_error(f"Couldn't delete: {e}")
         self._reload_track_list()
+        self._reload_playlists_list()
         self.toast(f"Deleted {len(track_ids)} track{'s' if len(track_ids) != 1 else ''}")

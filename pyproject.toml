@@ -8,6 +8,7 @@ license = { text = "GPL-3.0-or-later" }
 dependencies = [
     "PyGObject>=3.42",
     "mutagen>=1.46",
+    "Pillow>=10.0",
 ]
 
 [project.scripts]

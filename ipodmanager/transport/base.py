@@ -33,3 +33,8 @@ class Device:
         d = self.mount_root / self._control_dir_name() / "iTunes" / ".ipodmanager_backups"
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def artwork_dir(self) -> Path:
+        """iPod_Control/Artwork -- where ArtworkDB and its .ithmb files
+        live. Classic-iPod-only; not used for iphone-kind devices."""
+        return self.mount_root / self._control_dir_name() / "Artwork"
