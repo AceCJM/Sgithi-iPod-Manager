@@ -8,9 +8,33 @@ It reimplements the iPod's `iTunesDB` binary format from scratch in pure
 Python (no `libgpod` dependency). FLAC files are automatically transcoded
 to ALAC on import, since no iPod firmware can actually decode FLAC.
 
+<p align="center">
+  <img src="screenshots/02_track_list.png" width="49%" alt="Browsing an iPod's music library">
+  <img src="screenshots/04_playlists.png" width="49%" alt="Managing playlists">
+</p>
+<p align="center">
+  <img src="screenshots/05_playlist_opened.png" width="49%" alt="Viewing a playlist's tracks">
+  <img src="screenshots/06_preferences.png" width="49%" alt="Import quality preferences">
+</p>
+
+<details>
+<summary>More screenshots (empty state, multi-select)</summary>
+<br>
+<p align="center">
+  <img src="screenshots/01_empty_state.png" width="49%" alt="No iPod connected">
+  <img src="screenshots/03_tracks_selected.png" width="49%" alt="Multiple tracks selected">
+</p>
+</details>
+
 ## Status
 
-**Fully working — classic click-wheel iPods (e.g. iPod Video 5/5.5G):**
+| Device generation | Status |
+| --- | --- |
+| Classic click-wheel iPod (iPod Video 5/5.5G, etc.) | ✅ Fully working, verified against real hardware |
+| Classic iPod cover art (`ArtworkDB`) | ⚠️ Implemented, **not yet verified against real hardware** |
+| iPhone 3G / iPod Touch-generation | ⚠️ Partially working — imported tracks don't yet appear in the device's own Music app |
+
+### Fully working — classic click-wheel iPods
 
 - Detect a connected classic iPod (anything with `iPod_Control` on it),
   mounted as a plain USB drive
@@ -24,9 +48,8 @@ to ALAC on import, since no iPod firmware can actually decode FLAC.
   created (or reused, if one with that name already exists) containing
   them
 - Rename or delete a playlist, and add/remove individual tracks to/from
-  one (from the main track list's "Add to Playlist…", or "Remove from
-  Playlist" while browsing one) — deleting a playlist only removes the
-  playlist itself, never its member tracks or their files
+  one — deleting a playlist only removes the playlist itself, never its
+  member tracks or their files
 - Right-click context menus on both the track list and the Playlists view
   — Track Info, Add to Playlist, Remove from Playlist, Delete on tracks;
   Open, Rename, Delete on playlists — as a faster alternative to the
@@ -40,95 +63,64 @@ to ALAC on import, since no iPod firmware can actually decode FLAC.
   from playlist membership so nothing points at a deleted track)
 - Every write to `iTunesDB` is preceded by a timestamped backup under
   `iPod_Control/iTunes/.ipodmanager_backups/`
+- Detects (and warns about) stale track references left behind in any
+  `iTunesDB` section this app doesn't fully parse, instead of silently
+  claiming full cleanup
 
-**Implemented but unverified against real hardware — classic iPod album
-art (iPod Video 5/5.5G):**
+### Implemented but unverified — classic iPod album art
 
-- Song/album cover art embedded in an imported file's tags is written to
-  the device's `ArtworkDB` + `.ithmb` thumbnail files (100×100 and
-  200×200 RGB565, matching the iPod Video generation's on-device format),
-  so it should show up in the device's own now-playing/Cover
-  Flow UI — this is regenerated from scratch (re-scanning every track's
-  on-device file for embedded art) every time music is imported.
-- This one piece has **not** been confirmed against a real iPod — the
-  author doesn't own one. It was built the same way as the rest of the
-  classic-iPod code (transliterated from libgpod's actual C source, not
-  guessed), and every chunk length/nesting relationship is covered by
-  structural unit tests, but "does a real device actually render it" is
-  unverified. See "Classic iPod ArtworkDB: what's proven and what's not"
-  below before relying on it. Back up `iPod_Control` first.
-- "Playlist art" in this app's own Playlists view is a separate, much
-  lower-risk thing: just a thumbnail read from the first member track's
-  tags, shown only in this app's UI. Classic click-wheel firmware (even
-  the 5.5G's Cover Flow) has no native concept of a playlist thumbnail, so
-  there's nothing to write to the device for this part.
+Song/album cover art embedded in an imported file's tags is written to
+the device's `ArtworkDB` + `.ithmb` thumbnail files, matching the iPod
+Video generation's on-device format, so it should show up in the
+device's own now-playing/Cover Flow UI. This was built the same way as
+the rest of the classic-iPod code (transliterated from libgpod's actual
+C source, not guessed) and is covered by structural unit tests, but
+**has not been confirmed against a real iPod** — the author doesn't own
+one. See [`docs/HARDWARE_FINDINGS.md`](docs/HARDWARE_FINDINGS.md) for
+exactly what's proven vs. unverified, before relying on it — back up
+`iPod_Control` first.
 
-**Partially working — iPhone 3G / iPod Touch-generation devices:**
+("Playlist art" in this app's own Playlists view is a separate,
+lower-risk thing: just a thumbnail read from the first member track's
+tags, shown only in this app's UI — classic click-wheel firmware has no
+native concept of a playlist thumbnail, so nothing is written to the
+device for this part.)
+
+### Partially working — iPhone 3G / iPod Touch-generation devices
 
 - Detection and mounting over USB via `usbmuxd`/lockdown/AFC
   (`pymobiledevice3`) — no jailbreak or WiFi required, works over the USB
   cable directly
-- The classic-format layer (`iTunesCDB`, hash72-signed) is **fully working
-  and verified against real hardware**: writes are cryptographically
-  correct (byte-exact match against the real device, confirmed with the
-  actual libgpod C source compiled as ground truth) and durable across
-  reboots
+- The classic-format layer (`iTunesCDB`, hash72-signed) is **fully
+  working and verified against real hardware**: writes are
+  cryptographically correct and durable across reboots
 - **Tracks added this way do not appear in the device's own Music app.**
-  This is fully diagnosed (see "iPhone-generation devices" below) but not
-  solved. The underlying `Library.itdb`/`Locations.itdb` SQLite database
-  the Music app actually reads requires a `.cbk` checksum file whose
-  signing key doesn't match what's derivable from the device's own
-  classic-format secret — a data inconsistency intrinsic to the specific
-  test device, not a gap in this app's understanding of the format.
+  This is fully diagnosed but not solved — see
+  [`docs/HARDWARE_FINDINGS.md`](docs/HARDWARE_FINDINGS.md) for the full
+  investigation
+- **Fixed:** playlists not showing up in this app's own Playlists view on
+  some real devices, where the playlist list lives at a non-standard
+  `mhsd` index. The parser now identifies sections by their inner
+  container's magic instead of trusting a fixed index. If playlists still
+  don't show up, or tracks/playlists go missing, run the read-only
+  diagnostic below against the device before assuming it's a new bug:
 
-- **Fixed:** playlists not showing up in this app's own Playlists view.
-  Root-caused against a real iPhone 3G: libgpod's classic-iPod source (and
-  this app's original parser) assumes the playlist list always lives in
-  the `mhsd` section with `index == 2`, but a real device on newer
-  firmware (confirmed: `iTunesDB` version 110) instead used `index == 3`
-  for its actual playlist list, with a second, always-empty `mhlp`-shaped
-  section at `index == 5` holding Apple's built-in library category
-  placeholders (Music/Movies/TV Shows/Audiobooks/Tones/Rentals/Books) —
-  which must *not* be shown as if they were real playlists. The parser
-  now identifies a track/playlist list section by the magic of its own
-  inner container (`mhlt`/`mhlp`) instead of trusting `index`, and among
-  multiple `mhlp`-shaped sections picks the one that actually contains a
-  master playlist. Each section's original `index` is preserved on
-  write-back (not renumbered to the classic 1/2 convention), so a device
-  using non-standard index numbers keeps working after a save. Covered by
-  `tests/test_itunesdb.py::test_playlists_at_nonstandard_index_are_found_by_magic`,
-  built from the real device's own diagnostic output (see below).
-
-  If playlists still don't show up after this fix, or tracks/playlists go
-  missing on some other device, run the read-only diagnostic below
-  against the device's actual database before assuming it's a new bug —
-  it walks the real on-disk section structure and prints what it finds,
-  including each playlist's title, master/regular flag, and track count:
   ```
   python -m ipodmanager.diagnose
   ```
-  With the device connected over USB (and the app itself closed, so
-  nothing else has it mounted), this finds it, mounts it itself
-  read-only, and reports it. Share that output rather than the file
-  itself (it's your real library's metadata).
 
-**Not yet implemented:**
+  With the device connected over USB (and the app itself closed), this
+  mounts it read-only and reports what it finds, including each
+  playlist's title, master/regular flag, and track count. Share that
+  output rather than the file itself (it's your real library's metadata).
+
+### Not yet implemented
 
 - iPod 3G artwork: it has no color screen, so `ArtworkDB` writing is only
   ever attempted for the iPod Video 5/5.5G generation this app targets.
-- Any `mhsd` section this app doesn't understand (album/artist browse
-  indices, Genius data, and real iTunes's separately-formatted duplicate
-  of the podcast playlist grouped by show/album, mhsd type 3) is preserved
-  byte-for-byte on write, not regenerated. Deleting a track fully scrubs
-  it from the tracks list and every playlist this app actually parses
-  (including a podcast playlist's *regular* entry, which is what the
-  device firmware itself plays from) -- but if that same track is also
-  referenced inside one of those unrecognized sections, that copy is left
-  stale rather than risk corrupting a section whose full layout hasn't
-  been verified. The app detects this (by scanning for the track's ID in
-  a well-known, fixed-size record shape, without needing to understand
-  the section's full structure) and warns you when it happens, rather
-  than silently claiming full cleanup.
+- Any `iTunesDB` section this app doesn't understand (album/artist browse
+  indices, Genius data, real iTunes's podcast-playlist duplicate, etc.)
+  is preserved byte-for-byte on write, not regenerated.
 
 ## Setup
 
@@ -194,10 +186,11 @@ pip install pymobiledevice3
   + `.ithmb` thumbnail files (cover art). Same "transliterated from
   libgpod's actual C source, not reconstructed from memory" standard as
   `itunesdb.py`, but unlike that module, **not yet confirmed against real
-  hardware** — see the "Classic iPod ArtworkDB" section below. Always
-  rebuilds from scratch (re-reading every track's on-device file's tags)
-  rather than incrementally merging with whatever's already there, which
-  keeps the write path simple at the cost of a bit of extra I/O per sync.
+  hardware** — see [`docs/HARDWARE_FINDINGS.md`](docs/HARDWARE_FINDINGS.md).
+  Always rebuilds from scratch (re-reading every track's on-device file's
+  tags) rather than incrementally merging with whatever's already there,
+  which keeps the write path simple at the cost of a bit of extra I/O per
+  sync.
 - **`ipodmanager/db/hash72.py`** — the cryptographic signature
   iPhone/Touch/Nano-3G+-generation devices require over the classic
   format before they'll accept it. AES-128-CBC with a fixed key; ported
@@ -208,9 +201,9 @@ pip install pymobiledevice3
 - **`ipodmanager/db/sqlite_library.py`** — mirrors track add/remove into
   the iPhone-generation `Library.itdb`/`Locations.itdb` SQLite bundle.
   The schema and its triggers were reverse-engineered against a real
-  device's actual database (not guessed); see the "iPhone-generation
-  devices" section for why this alone isn't enough to make new tracks
-  show up in the Music app.
+  device's actual database (not guessed); see
+  [`docs/HARDWARE_FINDINGS.md`](docs/HARDWARE_FINDINGS.md) for why this
+  alone isn't enough to make new tracks show up in the Music app.
 - **`ipodmanager/audio/`** — `inspect.py` reads tags/artwork via `mutagen`;
   `transcode.py` shells out to `ffmpeg` for FLAC → ALAC and, when the
   quality setting is on, anything → AAC 320.
@@ -228,184 +221,11 @@ pip install pymobiledevice3
   then atomic rename).
 - **`ipodmanager/ui/`** — the GTK4 + libadwaita interface.
 
-## Classic iPod ArtworkDB: what's proven and what's not
+For the full, real-hardware-tested investigation behind the iPhone- and
+ArtworkDB-support caveats above — what's proven, what's not, and what to
+check first if you pick either back up — see
+[`docs/HARDWARE_FINDINGS.md`](docs/HARDWARE_FINDINGS.md).
 
-Unlike the rest of the classic-iPod code (verified against real hardware),
-nobody working on this project owns a physical classic iPod, so this piece
-has only been checked for internal consistency, not for what a real device
-actually does with it. Documenting it the same way as the iPhone findings
-below, so a future attempt (with real hardware) knows exactly what's solid
-and what to check first.
+## License
 
-**Proven, from libgpod's actual source, not guesses:**
-
-- The full chunk hierarchy — `mhfd` (top-level header) → three `mhsd`
-  sections (image list / album list / file list, indices 1/2/3) → `mhli`
-  → one `mhii` per track-with-artwork (keyed by the track's own `dbid`,
-  the same id used in its `iTunesDB` `mhit` record) → one `mhod`
-  (type=LOCATION) per thumbnail size → `mhni` (format id, dimensions,
-  padding, byte offset/size within the `.ithmb` file) → one more `mhod`
-  (type=FILE_NAME) holding the `.ithmb` filename — was transliterated
-  field-by-field from `src/db-artwork-writer.c` and `src/db-itunes-parser.h`,
-  including every struct's exact "padded" on-disk size (e.g. `mhii` is
-  152 bytes even though only 52 are meaningful, the rest is zero
-  padding — `get_padded_header_size()` in that same file spells out every
-  chunk's real size). Covered by structural round-trip tests in
-  `tests/test_artworkdb.py`.
-- The iPod Video (5th/5.5th generation)'s cover-art thumbnail formats —
-  two sizes, 100×100 (format id 1028) and 200×200 (format id 1029), both
-  raw RGB565 little-endian pixel data — come from
-  `ipod_video_cover_art_info[]` in `src/itdb_device.c`.
-- The scaling/packing algorithm — fit-to-bounding-box (not crop-to-fill;
-  the iPod Video's format table doesn't set `crop`), centered on a black
-  canvas, bilinear resize — was transliterated from
-  `ithumb_writer_scale_and_crop()`/`pack_RGB_565()` in
-  `src/ithumb-writer.c`.
-- A track's `iTunesDB` `mhit` record links to its `ArtworkDB` entry via
-  three fields at fixed offsets in its fixed header (`has_artwork` at
-  0xA4, `artwork_count` at 0x7C, and the artwork id itself — `mhii_link`
-  — at 0x160), matching field order in `src/db-itunes-parser.h`'s
-  `_MhitHeader` struct.
-- The files live at `iPod_Control/Artwork/ArtworkDB` and
-  `iPod_Control/Artwork/F<format_id>_0.ithmb`, per
-  `itdb_get_artwork_dir()`/`get_ithmb_filename()` in the same source tree.
-
-**Not proven:**
-
-- Whether a real iPod Video actually renders thumbnails built this way.
-  Nothing here has been checked against a real device's firmware
-  behavior — only against what libgpod's own C code would produce, which
-  is itself a third-party reimplementation, not Apple's specification.
-- Whether `has_artwork`/`artwork_count`/`mhii_link`'s exact byte offsets
-  and value conventions (1 = no artwork, 2 = has artwork) are current for
-  every classic-iPod firmware revision, or specific to what libgpod's
-  authors observed.
-
-**If picking this back up:** test on a spare/non-critical classic iPod
-Video, back up `iPod_Control` first, import one track with embedded
-artwork, and check the device's own now-playing screen and Cover Flow. If
-artwork doesn't appear, re-check `db/artworkdb.py`'s chunk structure
-against `db-artwork-writer.c` byte-by-byte before assuming the algorithm
-itself is wrong — the format has a lot of interdependent small structs,
-and this document is a checklist of exactly what's already been verified
-against libgpod's source vs. what's still unconfirmed on real hardware.
-
-## iPhone-generation devices: what's proven and what's not
-
-This section exists so a future attempt doesn't start from zero. Tested
-against a real, jailbroken iPhone 3G on iOS 4.2.1 whose library had
-previously been managed by a libgpod-based tool (gtkpod) from the same
-machine — which turned out to be exactly the right test case, since it
-meant every finding below could be checked against real, working,
-Apple-accepted artifacts already on the device.
-
-**Proven, with real evidence, not guesses:**
-
-- The device connects over `usbmuxd` (via `pymobiledevice3`), no WiFi or
-  jailbreak required for AFC access — even SSH, when needed, tunnels over
-  USB via `pymobiledevice3 usbmux forward`, no network needed at all.
-- The classic-format database lives at `iTunes_Control/iTunes/iTunesCDB`
-  (not `iTunesDB`, which is a vestigial 0-byte file on this generation),
-  and its body is zlib-compressed after a plaintext `mhbd` header — a
-  compression flag in the header (`unknown1 == 2`) signals this.
-- A correct sync requires bracketing the write with the real
-  lockdown/notification-proxy protocol real iTunes uses: post
-  `com.apple.itunes-mobdev.syncWillStart`, open and exclusively lock
-  `/com.apple.itunes.lock_sync` over AFC, post `syncLockRequest`, wait for
-  the lock, post `syncDidStart` — then write — then post `syncDidFinish`.
-- The `hash72` signature is required and verified correct byte-for-byte
-  against real hardware (see `db/hash72.py`'s docstring).
-- The Music app (`MobileMusicPlayer`) does **not** read the classic
-  format at all. It reads `iTunes_Control/iTunes/iTunes Library.itlp/
-  {Library,Locations,Dynamic,Extras}.itdb`, four SQLite databases it
-  `ATTACH`es together into one session on every launch. This was
-  confirmed by watching the device's live syslog during a real launch.
-- If any of those four fails a proprietary consistency check during
-  `ATTACH`, `MobileMusicPlayer` automatically restores **all four** from
-  a `DBTemp/Backup/` snapshot it keeps for exactly this purpose — this is
-  a built-in crash-recovery safety net, not something adversarial, but it
-  means a partial/inconsistent write gets silently reverted on next
-  launch (not immediately — a fresh AFC read right after writing still
-  shows the new content; the revert happens the next time
-  `MobileMusicPlayer` itself opens the database).
-- The specific failure, isolated via the device's live syslog: only
-  `Locations.itdb`'s `ATTACH` genuinely fails; `Dynamic.itdb`/
-  `Extras.itdb` failures are logged as `"failure due to prior failure"` —
-  cascading consequences, not independent problems.
-- `Locations.itdb.cbk` — a companion file alongside `Locations.itdb`,
-  626 bytes on the real device — is the checksum gating that `ATTACH`.
-  Its **exact structure and algorithm were found in libgpod's own source**
-  (`itdb_sqlite.c`'s `mk_Locations_cbk`, not guessed): SHA1 every
-  consecutive 1024-byte block of `Locations.itdb`, SHA1 the concatenation
-  of those block-hashes into one "meta-hash", then `hash72`-sign the
-  meta-hash with the same per-device secret used for the classic format.
-  This structure was verified exactly against the real file (byte-length
-  arithmetic and the meta-hash both matched precisely).
-- `itdbprepserver` (a separate on-device daemon, launched on-demand by
-  `SpringBoard` in response to the sync notifications) is **not** the
-  culprit — confirmed by disabling it entirely
-  (`defaults write -g itdbprepserverDisabled YES`, edited directly into
-  `/var/mobile/Library/Preferences/.GlobalPreferences.plist` since the
-  `defaults` CLI tool isn't present in this minimal jailbreak
-  environment) and observing the exact same revert behavior regardless.
-  (This preference was restored to its original absent state before
-  finishing.)
-
-**The actual, currently unresolved blocker:**
-
-Applying the documented `hash72` signing algorithm — using the exact same
-per-device secret that correctly, verifiably signs the classic format —
-to the real `Locations.itdb`'s own correctly-computed meta-hash does
-**not** reproduce the real device's actual `Locations.itdb.cbk` signature.
-This was checked as rigorously as possible before concluding it's a real
-dead end:
-
-1. The block-hash structure and meta-hash are proven correct (exact byte
-   match against the real file).
-2. The AES-128 implementation is proven correct in isolation (round-trips
-   perfectly on synthetic data) and against the classic format (exact
-   match on real hardware).
-3. As an ultimate ground-truth check, `itdb_hash72.c` + `rijndael.c` from
-   libgpod were compiled **verbatim** (see the session's working notes —
-   not committed here, since it's someone else's C source used only as a
-   diagnostic) and run directly. Even this produces the same mismatch.
-4. Most tellingly: extracting a secret from the real `.cbk` signature and
-   immediately re-signing the same data with that extracted secret —
-   which is pure algebra, mathematically guaranteed to round-trip
-   regardless of whether the extracted secret is "the true one" — **still
-   fails** to reproduce the second AES block. That should be impossible
-   for a straightforward hash72 signature, which strongly suggests this
-   device's `Locations.itdb.cbk` was signed under a secret that no longer
-   matches what's currently cached in its own `HashInfo` file (e.g. from
-   a secret re-bootstrap at some point in this specific device's history)
-   — a pre-existing inconsistency in this device's data, not a gap in the
-   algorithm as documented.
-
-**If picking this back up:** the most promising next step is probably a
-real decompiler (Hopper/IDA/Ghidra — not available in the environment
-this was built in) on `MusicLibrary.framework`'s `.cbk`-validation routine
-(`__MLSSqliteVFSCandyScanAndCheckP7BFilePaths` and whatever it calls,
-inside the framework embedded in `dyld_shared_cache_armv6` — it's not a
-standalone file on iOS 4.x, has to be extracted from the shared cache
-first) to find the actual validation logic on-device, rather than
-continuing to assume libgpod's approximation is exactly what the real
-firmware expects.
-
-## A note on testing
-
-Classic iPod support (including M3U playlist import and the AAC-320
-quality setting) has been verified with synthetic round-trip tests, a
-simulated fake device directory on disk, and the app itself launched and
-exercised end-to-end (empty state, populated track list, folder/playlist
-import with a live progress bar, playlist browsing, preferences) — but
-**not yet against real classic-iPod hardware**. `ArtworkDB` writing is
-further behind: it's only been checked for internal structural
-consistency (see the dedicated section above), never against a real
-device at all. Test with a **spare/non-critical library first**;
-automatic backups live on the device itself
-(`iPod_Control/iTunes/.ipodmanager_backups/`) — copy one off the device
-if you want a copy that survives a "restore iPod" in iTunes.
-
-The iPhone/iPod Touch classic-format path *has* been tested against real
-hardware (see above) and is durable; the SQLite/Music-app-visibility path
-has not been made to work at all yet.
+[GPL-3.0-or-later](LICENSE)
